@@ -137,15 +137,16 @@ def to_float(s):
     except ValueError:
         return None
 
-
 def fetch(url):
     try:
-        r = requests.get(url, headers=UA, timeout=15)
-        r.raise_for_status()
-        return r.text, None
+        with requests.Session() as s:
+            s.headers.update(UA)
+            s.headers["Referer"] = "/".join(url.split("/")[:3]) + "/"
+            r = s.get(url, timeout=15)
+            r.raise_for_status()
+            return r.text, None
     except Exception as e:
         return None, str(e)[:100]
-
 
 def parse(html, base):
     """Estrae (titolo, prezzo, valuta, link): prima da JSON-LD schema.org, poi euristica sui link."""
