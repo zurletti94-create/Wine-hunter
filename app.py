@@ -22,17 +22,22 @@ STOP = {"cantina", "cantine", "azienda", "agricola", "tenuta", "fattoria", "pode
         "marchesi", "domaine", "chateau", "maison", "bodega", "bodegas", "weingut", "winery",
         "estate", "famiglia", "vini", "vigneti", "des", "les", "del", "della", "dei", "von"}
 
-# Template di ricerca di partenza: verificali/correggili nella scheda "Siti" con il pulsante Prova.
+# Siti di partenza: (nome, paese, URL di ricerca con {q}, attivo).
+# Verificati: Tannico, Callmewine. Gli altri sono da controllare con "Prova" o con i link manuali.
+SHOPS_VERSION = 2
+OLD_DEFAULTS = ["Millésima", "Vinatis", "Vinissimus", "Bodeboca", "Weinfreunde", "Hawesko", "Wein & Co"]
 DEFAULT_SHOPS = [
-    ("Tannico", "Italia", "https://www.tannico.it/catalogsearch/result/?q={q}"),
-    ("Callmewine", "Italia", "https://www.callmewine.com/search?q={q}"),
-    ("Millésima", "Francia", "https://www.millesima.fr/catalogsearch/result/?q={q}"),
-    ("Vinatis", "Francia", "https://www.vinatis.com/recherche?search_query={q}"),
-    ("Vinissimus", "Spagna", "https://www.vinissimus.com/es/buscar/?q={q}"),
-    ("Bodeboca", "Spagna", "https://www.bodeboca.com/buscar?q={q}"),
-    ("Weinfreunde", "Germania", "https://www.weinfreunde.de/search?sSearch={q}"),
-    ("Hawesko", "Germania", "https://www.hawesko.de/suche?search={q}"),
-    ("Wein & Co", "Austria", "https://www.weinco.at/de/search?q={q}"),
+    ("Tannico", "Italia", "https://www.tannico.it/search?q={q}", 1),
+    ("Callmewine", "Italia", "https://www.callmewine.com/search?query={q}", 1),
+    ("Gino Frutta & Bistrot", "Italia", "https://ginofruttabistrot.it/?s={q}&post_type=product", 1),
+    ("Vinossimo", "Francia", "https://vinossimo.com/recherche?controller=search&s={q}", 1),
+    ("Buveur de vin", "Francia", "https://buveurdevin.com/?s={q}&post_type=product", 1),
+    ("La Pépinière", "Francia", "https://restaurant-cave-lapepiniere.com/search?q={q}&type=product", 1),
+    ("Les Zinzins du Vin", "Francia", "https://www.leszinzinsduvin.com/vins.php?q={q}", 0),  # URL di ricerca da trovare
+    ("Kierdorf Wein", "Germania", "https://www.kierdorfwein.de/search?search={q}", 1),
+    ("Weinfurore", "Germania", "https://www.weinfurore.de/suche?search={q}", 1),
+    ("Winerl", "Austria", "https://www.winerl.com/en/search?controller=search&s={q}", 1),
+    ("Versus", "Italia", "https://www.versus.wine/search?q={q}", 1),  # paese da confermare
 ]
 
 
@@ -59,8 +64,12 @@ def init():
         CREATE TABLE IF NOT EXISTS shops(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, url TEXT, enabled INTEGER DEFAULT 1);
         CREATE TABLE IF NOT EXISTS offers(id INTEGER PRIMARY KEY, wine_id INTEGER REFERENCES wines(id) ON DELETE CASCADE, shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE, title TEXT, price REAL, currency TEXT, link TEXT, found TEXT);
         """)
-        if not c.execute("SELECT 1 FROM shops").fetchone():
-            c.executemany("INSERT INTO shops(name,country,url) VALUES(?,?,?)", DEFAULT_SHOPS)
+        if c.execute("PRAGMA user_version").fetchone()[0] < SHOPS_VERSION:
+            c.executemany("DELETE FROM shops WHERE name=?", [(n,) for n in OLD_DEFAULTS])
+            c.executemany("INSERT INTO shops(name,country,url,enabled) VALUES(?,?,?,?) "
+                          "ON CONFLICT(name) DO UPDATE SET country=excluded.country, url=excluded.url, enabled=excluded.enabled",
+                          DEFAULT_SHOPS)
+            c.execute(f"PRAGMA user_version={SHOPS_VERSION}")
 
 
 def sync_rows(c, table, parent_col, parent_id, df, cols):
