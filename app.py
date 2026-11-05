@@ -24,22 +24,22 @@ STOP = {"cantina", "cantine", "azienda", "agricola", "tenuta", "fattoria", "pode
         "marchesi", "domaine", "chateau", "maison", "bodega", "bodegas", "weingut", "winery",
         "estate", "famiglia", "vini", "vigneti", "des", "les", "del", "della", "dei", "von"}
 
-# Siti di partenza: (nome, paese, URL di ricerca con {q}, attivo).
-# Verificati: Tannico, Callmewine. Gli altri sono da controllare con "Prova" o con i link manuali.
-SHOPS_VERSION = 3
+# Siti di partenza: (nome, paese, URL di ricerca con {q}, attivo, ricerca automatica).
+# auto=0: solo link manuali (il sito vieta l'accesso automatico, oppure cerca via JavaScript).
+SHOPS_VERSION = 5
 OLD_DEFAULTS = ["Millésima", "Vinatis", "Vinissimus", "Bodeboca", "Weinfreunde", "Hawesko", "Wein & Co"]
 DEFAULT_SHOPS = [
-    ("Tannico", "Italia", "https://www.tannico.it/search?q={q}", 1),
-    ("Callmewine", "Italia", "https://www.callmewine.com/search?query={q}", 1),
-    ("Gino Frutta & Bistrot", "Italia", "https://ginofruttabistrot.it/?s={q}&post_type=product", 1),
-    ("Vinossimo", "Francia", "https://vinossimo.com/recherche?controller=search&s={q}", 1),
-    ("Buveur de vin", "Francia", "https://buveurdevin.com/?s={q}&post_type=product", 1),
-    ("La Pépinière", "Francia", "https://restaurant-cave-lapepiniere.com/products.json", 1),
-    ("Les Zinzins du Vin", "Francia", "https://www.leszinzinsduvin.com/vins.php?q={q}", 0),  # URL di ricerca da trovare
-    ("Kierdorf Wein", "Germania", "https://www.kierdorfwein.de/search?search={q}", 1),
-    ("Weinfurore", "Germania", "https://www.weinfurore.de/suche?search={q}", 1),
-    ("Winerl", "Austria", "https://www.winerl.com/en/search?controller=search&s={q}", 1),
-    ("Versus", "Italia", "https://www.versus.wine/search?q={q}", 1),  # paese da confermare
+    ("Tannico", "Italia", "https://www.tannico.it/search?q={q}", 1, 1),
+    ("Callmewine", "Italia", "https://www.callmewine.com/search?query={q}", 1, 1),
+    ("Gino Frutta & Bistrot", "Italia", "https://ginofruttabistrot.it/?s={q}&post_type=product", 1, 1),
+    ("Vinossimo", "Francia", "https://vinossimo.com/recherche?controller=search&s={q}", 1, 1),
+    ("Buveur de vin", "Francia", "https://buveurdevin.com/?s={q}&post_type=product", 1, 1),
+    ("La Pépinière", "Francia", "https://restaurant-cave-lapepiniere.com/products.json", 1, 1),
+    ("Les Zinzins du Vin", "Francia", "https://www.leszinzinsduvin.com/vins.php", 0, 0),  # il sito non ha ricerca
+    ("Kierdorf Wein", "Germania", "https://www.kierdorfwein.de/search?keywords={q}&page=search&page_action=query", 1, 0),
+    ("Weinfurore", "Germania", "https://www.weinfurore.de/?qs={q}", 1, 1),
+    ("Winerl", "Austria", "https://www.winerl.com/en/#8b1f/mobile/m=and&q={q}", 1, 0),
+    ("Versus", "Italia", "https://www.versus.wine/catalogue?searchQuery={q}", 1, 0),  # paese da confermare
 ]
 
 
@@ -63,13 +63,15 @@ def init():
         c.executescript("""
         CREATE TABLE IF NOT EXISTS producers(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, region TEXT, subregion TEXT);
         CREATE TABLE IF NOT EXISTS wines(id INTEGER PRIMARY KEY, producer_id INTEGER REFERENCES producers(id) ON DELETE CASCADE, name TEXT, wine_type TEXT, grapes TEXT);
-        CREATE TABLE IF NOT EXISTS shops(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, url TEXT, enabled INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS shops(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, url TEXT, enabled INTEGER DEFAULT 1, auto INTEGER DEFAULT 1);
         CREATE TABLE IF NOT EXISTS offers(id INTEGER PRIMARY KEY, wine_id INTEGER REFERENCES wines(id) ON DELETE CASCADE, shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE, title TEXT, price REAL, currency TEXT, link TEXT, found TEXT);
         """)
+        if "auto" not in [r[1] for r in c.execute("PRAGMA table_info(shops)")]:
+            c.execute("ALTER TABLE shops ADD COLUMN auto INTEGER DEFAULT 1")
         if c.execute("PRAGMA user_version").fetchone()[0] < SHOPS_VERSION:
             c.executemany("DELETE FROM shops WHERE name=?", [(n,) for n in OLD_DEFAULTS])
-            c.executemany("INSERT INTO shops(name,country,url,enabled) VALUES(?,?,?,?) "
-                          "ON CONFLICT(name) DO UPDATE SET country=excluded.country, url=excluded.url, enabled=excluded.enabled",
+            c.executemany("INSERT INTO shops(name,country,url,enabled,auto) VALUES(?,?,?,?,?) "
+                          "ON CONFLICT(name) DO UPDATE SET country=excluded.country, url=excluded.url, enabled=excluded.enabled, auto=excluded.auto",
                           DEFAULT_SHOPS)
             c.execute(f"PRAGMA user_version={SHOPS_VERSION}")
 
@@ -149,12 +151,15 @@ def to_float(s):
         return None
 
 
-def build_url(tpl, text):
-    """Toglie il #frammento, aggiunge {q} se manca e inserisce il testo cercato."""
-    tpl = tpl.split("#")[0].strip()
+def build_url(tpl, text, fragment=False):
+    """Inserisce il testo cercato. fragment=True tiene il #frammento (serve ai link manuali dei siti con ricerca JavaScript)."""
+    tpl = tpl.strip()
+    had_q = "{q}" in tpl
+    if not fragment:
+        tpl = tpl.split("#")[0]
     if "products.json" in tpl:  # negozio Shopify letto via catalogo: il link manuale usa la ricerca del sito
         tpl = "/".join(tpl.split("/")[:3]) + "/search?q={q}"
-    if "{q}" not in tpl:
+    if "{q}" not in tpl and not had_q:  # se {q} era solo nel #frammento, la ricerca via server non è possibile
         tpl += "{q}"
     return tpl.replace("{q}", quote_plus(text))
 
@@ -406,7 +411,7 @@ with t3:
             sp = st.multiselect("Produttori (vuoto = tutti)", sorted(wines["producer"].unique()))
             sc = st.multiselect("Paesi dei siti", COUNTRIES, default=COUNTRIES)
             wl = wines[wines["producer"].isin(sp)] if sp else wines
-            sl = shops[shops["country"].isin(sc)]
+            sl = shops[shops["country"].isin(sc) & (shops["auto"] == 1)]
             jobs = [(w, s) for w in wl.to_dict("records") for s in sl.to_dict("records")]
             st.caption(f"{len(jobs)} ricerche ({len(wl)} vini × {len(sl)} siti)")
             if st.button("Cerca offerte", type="primary", disabled=not jobs):
@@ -432,7 +437,7 @@ with t3:
             mp = st.multiselect("Produttore", sorted(wines["producer"].unique()), key="mp")
             rows = [
                 {"Sito": s["name"], "Paese": s["country"], "Produttore": w["producer"], "Vino": w["wine"],
-                 "Cerca": build_url(s["url"], f'{w["producer"]} {w["wine"]}')}
+                 "Cerca": build_url(s["url"], f'{w["producer"]} {w["wine"]}', fragment=True)}
                 for s in shops.to_dict("records") if not ms or s["name"] in ms
                 for w in wines.to_dict("records") if not mp or w["producer"] in mp
             ]
@@ -469,15 +474,17 @@ with t3:
 # ── Siti
 with t4:
     st.caption("Usa {q} nell'URL al posto del testo cercato. Aggiungi righe per nuovi siti.")
-    sh = q("SELECT id,name,country,url,enabled FROM shops ORDER BY country,name")
+    sh = q("SELECT id,name,country,url,enabled,auto FROM shops ORDER BY country,name")
     sh["enabled"] = sh["enabled"].astype(bool)
+    sh["auto"] = sh["auto"].fillna(1).astype(bool)
     ed = st.data_editor(sh, num_rows="dynamic", hide_index=True, use_container_width=True, key="shops",
-                        column_config={"id": None, "name": "Nome", "url": "URL di ricerca", "enabled": "Attivo",
+                        column_config={"id": None, "name": "Nome", "url": "URL di ricerca", "enabled": "Attivo", "auto": "Ricerca automatica",
                                        "country": st.column_config.SelectboxColumn("Paese", options=COUNTRIES)})
     if st.button("💾 Salva siti"):
         ed["enabled"] = ed["enabled"].fillna(True).astype(int)
+        ed["auto"] = ed["auto"].fillna(True).astype(int)
         with db() as c:
-            sync_rows(c, "shops", None, None, ed, ["name", "country", "url", "enabled"])
+            sync_rows(c, "shops", None, None, ed, ["name", "country", "url", "enabled", "auto"])
         st.toast("Siti salvati ✅")
         st.rerun()
     st.subheader("🧪 Prova un sito")
@@ -485,25 +492,30 @@ with t4:
         tsite = st.selectbox("Sito", sh["name"])
         tq = st.text_input("Ricerca di prova", "Sassicaia")
         if st.button("Prova"):
-            turl = sh[sh["name"] == tsite].iloc[0]["url"]
-            if "products.json" in turl:
-                items, err = shopify_catalog(turl)
+            row = sh[sh["name"] == tsite].iloc[0]
+            turl = row["url"]
+            if not row["auto"]:
+                st.info("Per questo sito la ricerca automatica è disattivata (il sito non la consente): "
+                        "usa i link manuali nella scheda Offerte.")
             else:
-                url = build_url(turl, tq)
-                html, err = fetch(url)
-                items = [] if err else parse(html, url)
-            if err:
-                st.error(err)
-            else:
-                qt = tokens(tq)
-                rel = [i for i in items if all(x in norm(f"{i[0]} {i[3]}") for x in qt)]
-                st.write(f"{len(items)} prodotti sulla pagina, {len(rel)} pertinenti a «{tq}»")
-                if items and not rel:
-                    st.warning("Il sito sta ignorando la ricerca: mostra prodotti generici. Controlla l'URL (il parametro di ricerca) oppure usa i link manuali.")
-                elif not items:
-                    st.info("Nessun prodotto: il sito potrebbe caricare i risultati via JavaScript o bloccare i bot.")
-                if rel:
-                    st.dataframe(pd.DataFrame(rel, columns=["Titolo", "Prezzo", "Valuta", "Link"]), hide_index=True)
+                if "products.json" in turl:
+                    items, err = shopify_catalog(turl)
+                else:
+                    url = build_url(turl, tq)
+                    html, err = fetch(url)
+                    items = [] if err else parse(html, url)
+                if err:
+                    st.error(err)
+                else:
+                    qt = tokens(tq)
+                    rel = [i for i in items if all(x in norm(f"{i[0]} {i[3]}") for x in qt)]
+                    st.write(f"{len(items)} prodotti sulla pagina, {len(rel)} pertinenti a «{tq}»")
+                    if items and not rel:
+                        st.warning("Il sito sta ignorando la ricerca: mostra prodotti generici. Controlla l'URL (il parametro di ricerca) oppure usa i link manuali.")
+                    elif not items:
+                        st.info("Nessun prodotto: il sito potrebbe caricare i risultati via JavaScript o bloccare i bot.")
+                    if rel:
+                        st.dataframe(pd.DataFrame(rel, columns=["Titolo", "Prezzo", "Valuta", "Link"]), hide_index=True)
 
 # ── Backup
 with t5:
