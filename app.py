@@ -209,9 +209,10 @@ def parse(html, base):
 def search_one(w, s):
     html, err = fetch(build_url(s["url"], f'{w["producer"]} {w["wine"]}'))
     if err:
-        return w["wine_id"], s["id"], [], f'{s["name"]}: {err}'
+        return w["wine_id"], s["id"], [], f'{s["name"]}: {err}', 0
     ptok, wtok, res, seen = tokens(w["producer"]), tokens(w["wine"]), [], set()
-    for title, price, cur, link in parse(html, s["url"]):
+    raw = parse(html, s["url"])
+    for title, price, cur, link in raw:
         t = norm(title)
         if price is None or not 3 <= price <= 20000 or link in seen:
             continue
@@ -219,7 +220,7 @@ def search_one(w, s):
             continue
         seen.add(link)
         res.append((title[:200], price, cur, link))
-    return w["wine_id"], s["id"], res, None
+    return w["wine_id"], s["id"], res, None, len(raw)
 
 
 def save_offers(wid, sid, res):
@@ -329,14 +330,20 @@ with t3:
             jobs = [(w, s) for w in wl.to_dict("records") for s in sl.to_dict("records")]
             st.caption(f"{len(jobs)} ricerche ({len(wl)} vini × {len(sl)} siti)")
             if st.button("Cerca offerte", type="primary", disabled=not jobs):
-                bar, errs = st.progress(0.0), []
+                bar, errs, stats = st.progress(0.0), [], {}
                 with ThreadPoolExecutor(8) as ex:
-                    for i, (wid, sid, res, err) in enumerate(ex.map(lambda j: search_one(*j), jobs), 1):
+                    for i, (wid, sid, res, err, raw) in enumerate(ex.map(lambda j: search_one(*j), jobs), 1):
                         save_offers(wid, sid, res)
+                        a, b = stats.get(sid, (0, 0))
+                        stats[sid] = (a + raw, b + len(res))
                         if err:
                             errs.append(err)
                         bar.progress(i / len(jobs))
                 st.success("Ricerca completata.")
+                names = dict(zip(shops["id"], shops["name"]))
+                st.caption("Riepilogo per sito: se i prodotti sulla pagina sono molti ma i pertinenti zero, il sito ignora la ricerca (URL sbagliato o risultati caricati via JavaScript).")
+                st.dataframe(pd.DataFrame([{"Sito": names.get(k), "Prodotti sulla pagina": a, "Pertinenti": b}
+                                           for k, (a, b) in stats.items()]), hide_index=True)
                 if errs:
                     with st.expander(f"{len(errs)} errori"):
                         st.write("\n\n".join(sorted(set(errs))[:30]))
@@ -404,10 +411,15 @@ with t4:
                 st.error(err)
             else:
                 items = parse(html, url)
-                st.write(f"{len(items)} prodotti trovati")
-                st.dataframe(pd.DataFrame(items, columns=["Titolo", "Prezzo", "Valuta", "Link"]), hide_index=True)
-                if not items:
-                    st.info("Nessun risultato: il sito potrebbe caricare i prodotti via JavaScript o bloccare i bot.")
+                qt = tokens(tq)
+                rel = [i for i in items if all(x in norm(i[0]) for x in qt)]
+                st.write(f"{len(items)} prodotti sulla pagina, {len(rel)} pertinenti a «{tq}»")
+                if items and not rel:
+                    st.warning("Il sito sta ignorando la ricerca: mostra prodotti generici. Controlla l'URL (il parametro di ricerca) oppure usa i link manuali.")
+                elif not items:
+                    st.info("Nessun prodotto: il sito potrebbe caricare i risultati via JavaScript o bloccare i bot.")
+                if rel:
+                    st.dataframe(pd.DataFrame(rel, columns=["Titolo", "Prezzo", "Valuta", "Link"]), hide_index=True)
 
 # ── Backup
 with t5:
