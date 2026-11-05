@@ -26,18 +26,18 @@ STOP = {"cantina", "cantine", "azienda", "agricola", "tenuta", "fattoria", "pode
 
 # Siti di partenza: (nome, paese, URL di ricerca con {q}, attivo, ricerca automatica).
 # auto=0: solo link manuali (il sito vieta l'accesso automatico, oppure cerca via JavaScript).
-SHOPS_VERSION = 5
+SHOPS_VERSION = 6
 OLD_DEFAULTS = ["Millésima", "Vinatis", "Vinissimus", "Bodeboca", "Weinfreunde", "Hawesko", "Wein & Co"]
 DEFAULT_SHOPS = [
     ("Tannico", "Italia", "https://www.tannico.it/search?q={q}", 1, 1),
     ("Callmewine", "Italia", "https://www.callmewine.com/search?query={q}", 1, 1),
     ("Gino Frutta & Bistrot", "Italia", "https://ginofruttabistrot.it/?s={q}&post_type=product", 1, 1),
-    ("Vinossimo", "Francia", "https://vinossimo.com/recherche?controller=search&s={q}", 1, 1),
+    ("Vinossimo", "Francia", "https://vinossimo.com/recherche?controller=search&s={q}", 1, 0),
     ("Buveur de vin", "Francia", "https://buveurdevin.com/?s={q}&post_type=product", 1, 1),
     ("La Pépinière", "Francia", "https://restaurant-cave-lapepiniere.com/products.json", 1, 1),
     ("Les Zinzins du Vin", "Francia", "https://www.leszinzinsduvin.com/vins.php", 0, 0),  # il sito non ha ricerca
     ("Kierdorf Wein", "Germania", "https://www.kierdorfwein.de/search?keywords={q}&page=search&page_action=query", 1, 0),
-    ("Weinfurore", "Germania", "https://www.weinfurore.de/?qs={q}", 1, 1),
+    ("Weinfurore", "Germania", "https://www.weinfurore.de/?qs={q}", 1, 0),
     ("Winerl", "Austria", "https://www.winerl.com/en/#8b1f/mobile/m=and&q={q}", 1, 0),
     ("Versus", "Italia", "https://www.versus.wine/catalogue?searchQuery={q}", 1, 0),  # paese da confermare
 ]
