@@ -1,6 +1,8 @@
 import json
 import re
 import sqlite3
+import threading
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -24,7 +26,7 @@ STOP = {"cantina", "cantine", "azienda", "agricola", "tenuta", "fattoria", "pode
 
 # Siti di partenza: (nome, paese, URL di ricerca con {q}, attivo).
 # Verificati: Tannico, Callmewine. Gli altri sono da controllare con "Prova" o con i link manuali.
-SHOPS_VERSION = 2
+SHOPS_VERSION = 3
 OLD_DEFAULTS = ["Millésima", "Vinatis", "Vinissimus", "Bodeboca", "Weinfreunde", "Hawesko", "Wein & Co"]
 DEFAULT_SHOPS = [
     ("Tannico", "Italia", "https://www.tannico.it/search?q={q}", 1),
@@ -32,7 +34,7 @@ DEFAULT_SHOPS = [
     ("Gino Frutta & Bistrot", "Italia", "https://ginofruttabistrot.it/?s={q}&post_type=product", 1),
     ("Vinossimo", "Francia", "https://vinossimo.com/recherche?controller=search&s={q}", 1),
     ("Buveur de vin", "Francia", "https://buveurdevin.com/?s={q}&post_type=product", 1),
-    ("La Pépinière", "Francia", "https://restaurant-cave-lapepiniere.com/search?q={q}&type=product", 1),
+    ("La Pépinière", "Francia", "https://restaurant-cave-lapepiniere.com/products.json", 1),
     ("Les Zinzins du Vin", "Francia", "https://www.leszinzinsduvin.com/vins.php?q={q}", 0),  # URL di ricerca da trovare
     ("Kierdorf Wein", "Germania", "https://www.kierdorfwein.de/search?search={q}", 1),
     ("Weinfurore", "Germania", "https://www.weinfurore.de/suche?search={q}", 1),
@@ -150,6 +152,8 @@ def to_float(s):
 def build_url(tpl, text):
     """Toglie il #frammento, aggiunge {q} se manca e inserisce il testo cercato."""
     tpl = tpl.split("#")[0].strip()
+    if "products.json" in tpl:  # negozio Shopify letto via catalogo: il link manuale usa la ricerca del sito
+        tpl = "/".join(tpl.split("/")[:3]) + "/search?q={q}"
     if "{q}" not in tpl:
         tpl += "{q}"
     return tpl.replace("{q}", quote_plus(text))
@@ -215,17 +219,64 @@ def parse(html, base):
     return out
 
 
+_CAT, _LOCK = {}, threading.Lock()
+
+
+def shopify_catalog(url):
+    """Negozi Shopify: scarica una volta (cache 30 min) l'elenco prodotti da /products.json."""
+    with _LOCK:
+        hit = _CAT.get(url)
+        if hit and time.time() - hit[0] < 1800:
+            return hit[1], hit[2]
+        origin, items, err = "/".join(url.split("/")[:3]), [], None
+        for page in range(1, 9):
+            txt, err = fetch(f"{origin}/products.json?limit=250&page={page}")
+            if err:
+                break
+            try:
+                prods = json.loads(txt).get("products", [])
+            except Exception:
+                err = "risposta non valida (catalogo non pubblico?)"
+                break
+            for p in prods:
+                vs = p.get("variants", [])
+                ok = [v for v in vs if v.get("available")]
+                prices = [to_float(v.get("price")) for v in (ok or vs)]
+                prices = [x for x in prices if x]
+                if prices:
+                    title = f'{p.get("title", "")} - {p.get("vendor", "")}' + ("" if ok else " (non disponibile)")
+                    items.append((title, min(prices), "EUR", f'{origin}/products/{p.get("handle", "")}'))
+            if len(prods) < 250:
+                break
+        err = err if not items else None
+        _CAT[url] = (time.time(), items, err)
+        return items, err
+
+
+def matches(text, toks, strict=True):
+    """strict: servono tutte le parole (o quasi, se sono molte); altrimenti ne basta una."""
+    if not toks:
+        return True
+    hits = sum(x in text for x in toks)
+    if not strict:
+        return hits >= 1
+    return hits >= (len(toks) if len(toks) <= 3 else len(toks) - 1)
+
+
 def search_one(w, s):
-    html, err = fetch(build_url(s["url"], f'{w["producer"]} {w["wine"]}'))
+    if "products.json" in s["url"]:
+        raw, err = shopify_catalog(s["url"])
+    else:
+        html, err = fetch(build_url(s["url"], f'{w["producer"]} {w["wine"]}'))
+        raw = [] if err else parse(html, s["url"])
     if err:
         return w["wine_id"], s["id"], [], f'{s["name"]}: {err}', 0
     ptok, wtok, res, seen = tokens(w["producer"]), tokens(w["wine"]), [], set()
-    raw = parse(html, s["url"])
     for title, price, cur, link in raw:
         t = norm(f"{title} {link}")  # titolo + indirizzo del prodotto (di solito contiene produttore e vino)
         if price is None or not 3 <= price <= 20000 or link in seen:
             continue
-        if (ptok and not any(x in t for x in ptok)) or (wtok and not any(x in t for x in wtok)):
+        if not matches(t, ptok) or not matches(t, wtok, strict=False):
             continue
         seen.add(link)
         res.append((title[:200], price, cur, link))
@@ -414,12 +465,16 @@ with t4:
         tsite = st.selectbox("Sito", sh["name"])
         tq = st.text_input("Ricerca di prova", "Sassicaia")
         if st.button("Prova"):
-            url = build_url(sh[sh["name"] == tsite].iloc[0]["url"], tq)
-            html, err = fetch(url)
+            turl = sh[sh["name"] == tsite].iloc[0]["url"]
+            if "products.json" in turl:
+                items, err = shopify_catalog(turl)
+            else:
+                url = build_url(turl, tq)
+                html, err = fetch(url)
+                items = [] if err else parse(html, url)
             if err:
                 st.error(err)
             else:
-                items = parse(html, url)
                 qt = tokens(tq)
                 rel = [i for i in items if all(x in norm(f"{i[0]} {i[3]}") for x in qt)]
                 st.write(f"{len(items)} prodotti sulla pagina, {len(rel)} pertinenti a «{tq}»")
