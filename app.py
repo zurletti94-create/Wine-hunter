@@ -137,16 +137,26 @@ def to_float(s):
     except ValueError:
         return None
 
+
+def build_url(tpl, text):
+    """Toglie il #frammento, aggiunge {q} se manca e inserisce il testo cercato."""
+    tpl = tpl.split("#")[0].strip()
+    if "{q}" not in tpl:
+        tpl += "{q}"
+    return tpl.replace("{q}", quote_plus(text))
+
+
 def fetch(url):
     try:
-        with requests.Session() as s:
-            s.headers.update(UA)
-            s.headers["Referer"] = "/".join(url.split("/")[:3]) + "/"
-            r = s.get(url, timeout=15)
+        with requests.Session() as sess:
+            sess.headers.update(UA)
+            sess.headers["Referer"] = "/".join(url.split("/")[:3]) + "/"
+            r = sess.get(url, timeout=15)
             r.raise_for_status()
             return r.text, None
     except Exception as e:
         return None, str(e)[:100]
+
 
 def parse(html, base):
     """Estrae (titolo, prezzo, valuta, link): prima da JSON-LD schema.org, poi euristica sui link."""
@@ -197,7 +207,7 @@ def parse(html, base):
 
 
 def search_one(w, s):
-    html, err = fetch(s["url"].replace("{q}", quote_plus(f'{w["producer"]} {w["wine"]}')))
+    html, err = fetch(build_url(s["url"], f'{w["producer"]} {w["wine"]}'))
     if err:
         return w["wine_id"], s["id"], [], f'{s["name"]}: {err}'
     ptok, wtok, res, seen = tokens(w["producer"]), tokens(w["wine"]), [], set()
@@ -330,6 +340,20 @@ with t3:
                 if errs:
                     with st.expander(f"{len(errs)} errori"):
                         st.write("\n\n".join(sorted(set(errs))[:30]))
+        with st.expander("🔗 Link di ricerca manuali (per i siti che bloccano l'app)"):
+            ms = st.multiselect("Sito", sorted(shops["name"]), key="ms")
+            mp = st.multiselect("Produttore", sorted(wines["producer"].unique()), key="mp")
+            rows = [
+                {"Sito": s["name"], "Paese": s["country"], "Produttore": w["producer"], "Vino": w["wine"],
+                 "Cerca": build_url(s["url"], f'{w["producer"]} {w["wine"]}')}
+                for s in shops.to_dict("records") if not ms or s["name"] in ms
+                for w in wines.to_dict("records") if not mp or w["producer"] in mp
+            ]
+            st.caption(f"{len(rows)} link")
+            if rows:
+                st.dataframe(pd.DataFrame(rows).sort_values(["Sito", "Produttore", "Vino"]),
+                             use_container_width=True, hide_index=True,
+                             column_config={"Cerca": st.column_config.LinkColumn("Link", display_text="Apri")})
         off = q("""SELECT p.name Produttore, w.name Vino, w.wine_type Tipo, s.name Sito, s.country Paese,
                    o.title Titolo, o.price Prezzo, o.link Link, o.found Aggiornato
                    FROM offers o JOIN wines w ON w.id=o.wine_id JOIN producers p ON p.id=w.producer_id
@@ -374,7 +398,7 @@ with t4:
         tsite = st.selectbox("Sito", sh["name"])
         tq = st.text_input("Ricerca di prova", "Sassicaia")
         if st.button("Prova"):
-            url = sh[sh["name"] == tsite].iloc[0]["url"].replace("{q}", quote_plus(tq))
+            url = build_url(sh[sh["name"] == tsite].iloc[0]["url"], tq)
             html, err = fetch(url)
             if err:
                 st.error(err)
