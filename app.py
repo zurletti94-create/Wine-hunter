@@ -6,7 +6,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -171,7 +171,7 @@ def fetch(url):
         return None, str(e)[:100]
 
 
-def parse(html, base):
+def _parse(html, base):
     """Estrae (titolo, prezzo, valuta, link): prima da JSON-LD schema.org, poi euristica sui link."""
     soup, out = BeautifulSoup(html, "html.parser"), []
 
@@ -201,7 +201,7 @@ def parse(html, base):
         return out
     for a in soup.find_all("a", href=True):
         title = a.get_text(" ", strip=True)
-        if len(title) < 8:
+        if len(title) < 8 or norm(title) in BUTTONS:
             continue
         box, m = a, None
         for _ in range(4):
@@ -216,6 +216,26 @@ def parse(html, base):
             box = box.parent
         if m:
             out.append((title, to_float(m.group(1) or m.group(2)), "EUR", urljoin(base, a["href"])))
+    return out
+
+
+# Testi dei pulsanti dei negozi: non sono nomi di prodotti
+BUTTONS = {"ajouter au panier", "lire la suite", "choix des options", "add to cart", "read more", "select options",
+           "aggiungi al carrello", "leggi tutto", "scegli le opzioni", "in den warenkorb", "weiterlesen",
+           "mehr erfahren", "anadir al carrito", "leer mas", "voir le produit", "acquista ora", "acquista",
+           "dettagli", "details", "buy now", "quick view", "vedi prodotto", "zum produkt"}
+
+
+def parse(html, base):
+    """Come _parse, ma elimina i duplicati (stesso prodotto trovato da più link: titolo, immagine, pulsante)."""
+    out, seen = [], set()
+    for title, price, cur, link in _parse(html, base):
+        u = urlparse(link)
+        key = f"{u.netloc}{u.path}" if len(u.path.strip("/")) > 3 else link
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((title, price, cur, link))
     return out
 
 
