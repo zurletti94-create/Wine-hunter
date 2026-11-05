@@ -213,7 +213,7 @@ def search_one(w, s):
     ptok, wtok, res, seen = tokens(w["producer"]), tokens(w["wine"]), [], set()
     raw = parse(html, s["url"])
     for title, price, cur, link in raw:
-        t = norm(title)
+        t = norm(f"{title} {link}")  # titolo + indirizzo del prodotto (di solito contiene produttore e vino)
         if price is None or not 3 <= price <= 20000 or link in seen:
             continue
         if (ptok and not any(x in t for x in ptok)) or (wtok and not any(x in t for x in wtok)):
@@ -412,7 +412,7 @@ with t4:
             else:
                 items = parse(html, url)
                 qt = tokens(tq)
-                rel = [i for i in items if all(x in norm(i[0]) for x in qt)]
+                rel = [i for i in items if all(x in norm(f"{i[0]} {i[3]}") for x in qt)]
                 st.write(f"{len(items)} prodotti sulla pagina, {len(rel)} pertinenti a «{tq}»")
                 if items and not rel:
                     st.warning("Il sito sta ignorando la ricerca: mostra prodotti generici. Controlla l'URL (il parametro di ricerca) oppure usa i link manuali.")
