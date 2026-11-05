@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 import sqlite3
@@ -6,6 +7,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from html import escape
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import pandas as pd
@@ -103,6 +105,85 @@ def save_producer(pid, name, country, region, sub, wines):
             c.execute("UPDATE producers SET name=?,country=?,region=?,subregion=? WHERE id=?",
                       (name, country, region, sub, pid))
         sync_rows(c, "wines", "producer_id", pid, wines, ["name", "wine_type", "grapes"])
+
+
+# ───────────────────────── Salvataggio permanente (repository GitHub privato) ─────────────────────────
+TABLES = ["producers", "wines", "shops", "offers"]
+GH = "https://api.github.com"
+
+
+def dump():
+    data = {t: q(f"SELECT * FROM {t}").to_dict("records") for t in TABLES}
+    con = db()
+    try:
+        data["meta"] = {"shops_version": con.execute("PRAGMA user_version").fetchone()[0]}
+    finally:
+        con.close()
+    return data
+
+
+def restore(data):
+    with db() as c:
+        for t in reversed(TABLES):
+            c.execute(f"DELETE FROM {t}")
+        for t in TABLES:
+            df = pd.DataFrame(data.get(t, []))
+            if not df.empty:
+                df.to_sql(t, c, if_exists="append", index=False)
+        c.execute(f"PRAGMA user_version={int(data.get('meta', {}).get('shops_version', 0))}")
+
+
+def gh_conf():
+    tok, repo = secret("GITHUB_TOKEN"), secret("GITHUB_REPO")
+    return (tok, repo) if tok and repo else None
+
+
+def gh_call(method, accept="application/vnd.github+json", **kw):
+    tok, repo = gh_conf()
+    h = {"Authorization": f"Bearer {tok}", "Accept": accept, "X-GitHub-Api-Version": "2022-11-28"}
+    return requests.request(method, f"{GH}/repos/{repo}/contents/wine_data.json", headers=h, timeout=30, **kw)
+
+
+def pull_backup():
+    if not gh_conf():
+        return False
+    try:
+        r = gh_call("GET", accept="application/vnd.github.raw+json")
+        if r.status_code != 200:
+            return False
+        restore(r.json())
+        return True
+    except Exception:
+        return False
+
+
+def push_backup():
+    """Salva tutti i dati su GitHub. None = non configurato, True/False = riuscito o no."""
+    if not gh_conf():
+        return None
+    try:
+        m = gh_call("GET")
+        body = {"message": "backup " + datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "content": base64.b64encode(json.dumps(dump(), ensure_ascii=False, default=str).encode()).decode()}
+        if m.status_code == 200 and m.json().get("sha"):
+            body["sha"] = m.json()["sha"]
+        return gh_call("PUT", json=body).status_code in (200, 201)
+    except Exception:
+        return False
+
+
+def autosave():
+    if push_backup() is False:
+        st.toast("⚠️ Salvataggio su GitHub non riuscito: scarica un backup dalla scheda Dati.")
+
+
+@st.cache_resource
+def first_boot():
+    """Una volta per ogni avvio dell'app: se il database è vuoto, ripristina i dati da GitHub."""
+    if q("SELECT 1 FROM producers LIMIT 1").empty and pull_backup():
+        init()
+        return True
+    return False
 
 
 # ───────────────────────── Compilazione automatica (LLM) ─────────────────────────
@@ -316,6 +397,88 @@ def save_offers(wid, sid, res):
                       [(wid, sid, t, p, cu, l, now) for t, p, cu, l in res])
 
 
+# ───────────────────────── Annata, formato, schede ─────────────────────────
+FORMATS = {"magnum": 1.5, "jeroboam": 3.0, "jéroboam": 3.0, "mathusalem": 6.0, "demi-bouteille": 0.375,
+           "demi bouteille": 0.375, "half bottle": 0.375, "mezza bottiglia": 0.375, "halbe flasche": 0.375}
+
+
+def wine_vintage(title, link=""):
+    for txt in (str(title), str(link)):
+        m = re.search(r"(?<!\d)(19[5-9]\d|20[0-3]\d)(?!\d)", txt)
+        if m:
+            return m.group(1)
+    return "n/d"
+
+
+def wine_format(title):
+    t = str(title).lower()
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s?(cl|ml|l|lt|litri|liter|litre)\b", t)
+    if m:
+        v = float(m.group(1).replace(",", "."))
+        v = v / 100 if m.group(2) == "cl" else v / 1000 if m.group(2) == "ml" else v
+        if 0.1 <= v <= 18:
+            return round(v, 3)
+    for k, v in FORMATS.items():
+        if k in t:
+            return v
+    return 0.75
+
+
+def fmt_label(v):
+    names = {0.375: "37,5 cl", 0.75: "75 cl", 1.5: "Magnum 1,5 L", 3.0: "Jéroboam 3 L", 6.0: "Mathusalem 6 L"}
+    return names.get(v, f"{v:g} L".replace(".", ","))
+
+
+def eur(p):
+    return "€ " + f"{p:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def offer_card(r):
+    link = str(r["Link"])
+    href = escape(link, quote=True) if link.startswith(("http://", "https://")) else "#"
+    more = (f'<div class="wh-note">{int(r["N"])} offerte: da {eur(r["Prezzo"])} a {eur(r["Max"])}</div>'
+            if r["N"] > 1 else "")
+    return ('<div class="wh-card"><div class="wh-top"><div>'
+            f'<div class="wh-prod">{escape(str(r["Produttore"]))}</div><div class="wh-wine">{escape(str(r["Vino"]))}</div>'
+            f'<div class="wh-tags"><span>{escape(str(r["Annata"]))}</span><span>{escape(fmt_label(r["Formato"]))}</span></div></div>'
+            f'<div class="wh-price">{eur(r["Prezzo"])}</div></div>'
+            f'<div class="wh-foot"><span>{escape(str(r["Sito"]))} · {escape(str(r["Paese"]))}</span>'
+            f'<a href="{href}" target="_blank" rel="noopener noreferrer">Apri ↗</a></div>{more}</div>')
+
+
+def kpis(items):
+    return '<div class="wh-kpi">' + "".join(f"<div><b>{v}</b><span>{k}</span></div>" for k, v in items) + "</div>"
+
+
+CSS = """<style>
+:root{--wine:#A6264A;--wine-d:#7E1B38;--line:rgba(127,127,127,.28);--soft:rgba(127,127,127,.09)}
+.block-container{padding-top:2rem;padding-bottom:3rem;max-width:1100px}
+@media (max-width:640px){.block-container{padding-left:.8rem;padding-right:.8rem}}
+h1,h2,h3{font-family:Georgia,'Times New Roman',serif}
+.wh-hero h1{margin:0;padding:0;font-size:2rem;color:var(--wine)}
+.wh-hero p{margin:.1rem 0 .8rem;opacity:.7}
+.wh-kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:.5rem;margin-bottom:.8rem}
+.wh-kpi div{background:var(--soft);border:1px solid var(--line);border-radius:12px;padding:.5rem .7rem;text-align:center}
+.wh-kpi b{display:block;font-size:1.35rem;font-family:Georgia,serif;color:var(--wine)}
+.wh-kpi span{font-size:.72rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em}
+@media (max-width:640px){.wh-kpi{grid-template-columns:repeat(2,1fr)}}
+.wh-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:.7rem}
+.wh-card{background:var(--soft);border:1px solid var(--line);border-left:4px solid var(--wine);border-radius:12px;padding:.8rem .9rem}
+.wh-top{display:flex;justify-content:space-between;gap:.8rem;align-items:flex-start}
+.wh-prod{font-size:.78rem;opacity:.7;text-transform:uppercase;letter-spacing:.05em}
+.wh-wine{font-family:Georgia,serif;font-size:1.05rem;font-weight:600;line-height:1.25;margin:.1rem 0 .35rem}
+.wh-tags span{display:inline-block;font-size:.72rem;border:1px solid var(--line);border-radius:99px;padding:.05rem .5rem;margin-right:.3rem}
+.wh-price{font-family:Georgia,serif;font-size:1.35rem;font-weight:700;color:var(--wine);white-space:nowrap}
+.wh-foot{display:flex;justify-content:space-between;align-items:center;margin-top:.6rem;font-size:.85rem}
+.wh-foot a{color:var(--wine);font-weight:600;text-decoration:none}
+.wh-note{margin-top:.35rem;font-size:.75rem;opacity:.65}
+button[kind="primary"],button[data-testid="stBaseButton-primary"]{background:var(--wine);border-color:var(--wine);color:#fff}
+button[kind="primary"]:hover,button[data-testid="stBaseButton-primary"]:hover{background:var(--wine-d);border-color:var(--wine-d);color:#fff}
+.stTabs [aria-selected="true"]{color:var(--wine)}
+.stTabs [data-baseweb="tab-highlight"]{background-color:var(--wine)}
+</style>"""
+
+
 # ───────────────────────── UI ─────────────────────────
 def producer_form(pid, d, wines, key):
     name = st.text_input("Produttore", d["name"], key=f"n{key}")
@@ -335,6 +498,7 @@ def producer_form(pid, d, wines, key):
         else:
             try:
                 save_producer(pid, name.strip(), country, region, sub, wines)
+                autosave()
                 st.session_state.draft = None
                 st.toast("Salvato ✅")
                 st.rerun()
@@ -343,13 +507,20 @@ def producer_form(pid, d, wines, key):
     if pid and b2.button("🗑️ Elimina", key=f"del{key}"):
         with db() as c:
             c.execute("DELETE FROM producers WHERE id=?", (int(pid),))
+        autosave()
         st.rerun()
 
 
 st.set_page_config(page_title="Wine Hunter", page_icon="🍷", layout="wide")
 init()
-st.title("🍷 Wine Hunter")
-t1, t2, t3, t4, t5 = st.tabs(["📒 Rubrica", "➕ Nuovo", "🛒 Offerte", "🌐 Siti", "💾 Backup"])
+first_boot()
+st.markdown(CSS, unsafe_allow_html=True)
+_n = lambda sql: int(q(sql).iloc[0, 0])
+st.markdown('<div class="wh-hero"><h1>🍷 Wine Hunter</h1><p>Rubrica dei produttori e caccia al miglior prezzo</p></div>'
+            + kpis([("Produttori", _n("SELECT COUNT(*) FROM producers")), ("Vini", _n("SELECT COUNT(*) FROM wines")),
+                    ("Offerte", _n("SELECT COUNT(*) FROM offers")), ("Siti attivi", _n("SELECT COUNT(*) FROM shops WHERE enabled=1"))]),
+            unsafe_allow_html=True)
+t1, t2, t3, t4, t5 = st.tabs(["📒 Rubrica", "➕ Nuovo", "🛒 Offerte", "🌐 Siti", "💾 Dati"])
 
 # ── Rubrica
 with t1:
@@ -424,6 +595,7 @@ with t3:
                         if err:
                             errs.append(err)
                         bar.progress(i / len(jobs))
+                autosave()
                 st.success("Ricerca completata.")
                 names = dict(zip(shops["id"], shops["name"]))
                 st.caption("Riepilogo per sito: se i prodotti sulla pagina sono molti ma i pertinenti zero, il sito ignora la ricerca (URL sbagliato o risultati caricati via JavaScript).")
@@ -453,23 +625,39 @@ with t3:
         if off.empty:
             st.info("Nessuna offerta salvata: avvia una ricerca.")
         else:
-            f1, f2 = st.columns(2)
-            fp = f1.multiselect("Paese del sito", COUNTRIES)
-            fs = f2.multiselect("Sito", sorted(off["Sito"].unique()))
-            fprod = st.multiselect("Produttore", sorted(off["Produttore"].unique()))
-            lo, hi = float(off["Prezzo"].min()), float(off["Prezzo"].max())
-            pr = st.slider("Prezzo (€)", lo, hi, (lo, hi)) if lo < hi else (lo, hi)
-            if fp:
-                off = off[off["Paese"].isin(fp)]
-            if fs:
-                off = off[off["Sito"].isin(fs)]
-            if fprod:
-                off = off[off["Produttore"].isin(fprod)]
+            off["Annata"] = [wine_vintage(t, l) for t, l in zip(off["Titolo"], off["Link"])]
+            off["Formato"] = off["Titolo"].map(wine_format)
+            with st.expander("🎛️ Filtri"):
+                fp = st.multiselect("Paese del sito", COUNTRIES)
+                fs = st.multiselect("Sito", sorted(off["Sito"].unique()))
+                fprod = st.multiselect("Produttore", sorted(off["Produttore"].unique()))
+                fa = st.multiselect("Annata", sorted(off["Annata"].unique(), reverse=True))
+                ff = st.multiselect("Formato", sorted(off["Formato"].unique()), format_func=fmt_label)
+                lo, hi = float(off["Prezzo"].min()), float(off["Prezzo"].max())
+                pr = st.slider("Prezzo (€)", lo, hi, (lo, hi)) if lo < hi else (lo, hi)
+            for col, sel in (("Paese", fp), ("Sito", fs), ("Produttore", fprod), ("Annata", fa), ("Formato", ff)):
+                if sel:
+                    off = off[off[col].isin(sel)]
             off = off[off["Prezzo"].between(*pr)].sort_values("Prezzo")
-            st.caption(f"{len(off)} bottiglie")
-            st.dataframe(off, use_container_width=True, hide_index=True, column_config={
-                "Link": st.column_config.LinkColumn("Link", display_text="Apri"),
-                "Prezzo": st.column_config.NumberColumn("Prezzo", format="€ %.2f")})
+            view = st.radio("Vista", ["🏆 Migliori prezzi", "📋 Tutte le offerte"], horizontal=True, label_visibility="collapsed")
+            if view.startswith("🏆"):
+                best = (off.groupby(["Produttore", "Vino", "Annata", "Formato"], as_index=False, sort=False)
+                        .agg(Prezzo=("Prezzo", "min"), Max=("Prezzo", "max"), N=("Prezzo", "size"),
+                             Sito=("Sito", "first"), Paese=("Paese", "first"), Link=("Link", "first")))
+                best["_a"] = best["Annata"].where(best["Annata"] != "n/d", "0000")
+                best = best.sort_values(["Produttore", "Vino", "_a", "Formato"], ascending=[True, True, False, True])
+                st.caption(f"{len(best)} combinazioni vino · annata · formato, con il miglior prezzo trovato")
+                more = len(best) > 30 and st.toggle(f"Mostra tutte le {len(best)}", False)
+                shown = best if more else best.head(30)
+                st.markdown('<div class="wh-grid">' + "".join(offer_card(r) for r in shown.to_dict("records")) + "</div>",
+                            unsafe_allow_html=True)
+            else:
+                st.caption(f"{len(off)} offerte")
+                st.dataframe(off.assign(Formato=off["Formato"].map(fmt_label))[
+                    ["Produttore", "Vino", "Annata", "Formato", "Prezzo", "Sito", "Paese", "Titolo", "Link", "Aggiornato"]],
+                    use_container_width=True, hide_index=True, column_config={
+                        "Link": st.column_config.LinkColumn("Link", display_text="Apri"),
+                        "Prezzo": st.column_config.NumberColumn("Prezzo", format="€ %.2f")})
 
 # ── Siti
 with t4:
@@ -485,6 +673,7 @@ with t4:
         ed["auto"] = ed["auto"].fillna(True).astype(int)
         with db() as c:
             sync_rows(c, "shops", None, None, ed, ["name", "country", "url", "enabled", "auto"])
+        autosave()
         st.toast("Siti salvati ✅")
         st.rerun()
     st.subheader("🧪 Prova un sito")
@@ -517,22 +706,23 @@ with t4:
                     if rel:
                         st.dataframe(pd.DataFrame(rel, columns=["Titolo", "Prezzo", "Valuta", "Link"]), hide_index=True)
 
-# ── Backup
+# ── Dati
 with t5:
-    st.warning("Su Streamlit Community Cloud il disco si azzera a ogni riavvio dell'app: scarica un backup regolarmente.")
-    TABLES = ["producers", "wines", "shops", "offers"]
-    data = {t: q(f"SELECT * FROM {t}").to_dict("records") for t in TABLES}
-    st.download_button("⬇️ Scarica backup", json.dumps(data, ensure_ascii=False, default=str),
+    if gh_conf():
+        st.success("☁️ Salvataggio automatico su GitHub attivo: i dati sopravvivono ai riavvii dell'app.")
+        if st.button("Salva ora su GitHub"):
+            if push_backup():
+                st.success("Salvato.")
+            else:
+                st.error("Salvataggio non riuscito: controlla GITHUB_TOKEN e GITHUB_REPO nei Secrets.")
+    else:
+        st.warning("Salvataggio automatico non configurato: i dati si azzerano a ogni riavvio dell'app. "
+                   "Aggiungi GITHUB_TOKEN e GITHUB_REPO nei Secrets, oppure scarica un backup a mano.")
+    st.download_button("⬇️ Scarica backup", json.dumps(dump(), ensure_ascii=False, default=str),
                        "wine_backup.json", "application/json")
     up = st.file_uploader("Ripristina da backup", type="json")
     if up and st.button("♻️ Ripristina (sovrascrive tutto)"):
-        data = json.load(up)
-        with db() as c:
-            for t in reversed(TABLES):
-                c.execute(f"DELETE FROM {t}")
-            for t in TABLES:
-                df = pd.DataFrame(data.get(t, []))
-                if not df.empty:
-                    df.to_sql(t, c, if_exists="append", index=False)
+        restore(json.load(up))
+        autosave()
         st.success("Ripristinato.")
         st.rerun()
