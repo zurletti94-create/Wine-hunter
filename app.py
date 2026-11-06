@@ -227,16 +227,24 @@ def gemini_candidates():
 def gemini_call(prompt):
     last, fixed = "nessun modello 'flash' trovato per questa chiave", bool(secret("GEMINI_MODEL"))
     for model in gemini_candidates():
-        r = requests.post(f"{GEM}/models/{model}:generateContent",
-                          headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
-                          json={"contents": [{"parts": [{"text": prompt}]}],
-                                "generationConfig": {"responseMimeType": "application/json"}}, timeout=60)
-        if r.status_code in (403, 404, 429) and not fixed:  # modello spento o non gratuito: provo il successivo
+        for attempt in range(2):  # un secondo tentativo se Google è momentaneamente sovraccarico
+            r = requests.post(f"{GEM}/models/{model}:generateContent",
+                              headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
+                              json={"contents": [{"parts": [{"text": prompt}]}],
+                                    "generationConfig": {"responseMimeType": "application/json"}}, timeout=60)
+            if r.status_code in (500, 502, 503, 504) and attempt == 0:
+                time.sleep(2)
+                continue
+            break
+        if r.status_code in (403, 404, 429, 500, 502, 503, 504):  # spento, non gratuito, limite o sovraccarico
             last = f"{model}: errore {r.status_code}"
+            if fixed:
+                break
             continue
         r.raise_for_status()
         return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    raise RuntimeError(f"Nessun modello Gemini utilizzabile ({last}). Controlla la chiave o imposta GEMINI_MODEL nei Secrets.")
+    raise RuntimeError(f"Gemini non ha risposto ({last}). Con errori 503 o 429 riprova tra un minuto; "
+                       "altrimenti controlla la chiave o il modello nei Secrets.")
 
 
 def autofill(producer):
