@@ -519,6 +519,63 @@ def verify_wines(wines, evidence):
     return out
 
 
+def producer_key(name):
+    return " ".join(sorted(tokens(name))) or norm(name)
+
+
+def find_producer(name):
+    """Produttore già in rubrica con lo stesso nome (ignora maiuscole, accenti, ordine e parole come Domaine/Tenuta)."""
+    k = producer_key(name)
+    for r in q("SELECT id, name FROM producers").to_dict("records"):
+        if producer_key(r["name"]) == k:
+            return r
+    return None
+
+
+def _txt(x):
+    return "" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x).strip()
+
+
+def compare_wines(pid, wines):
+    """Confronta i vini proposti con quelli già salvati: (nuovi, già presenti)."""
+    have = {wine_key(n) for n in q("SELECT name FROM wines WHERE producer_id=?", (int(pid),))["name"]}
+    new, known = [], []
+    for n in wines["name"]:
+        n = _txt(n)
+        if wine_key(n):
+            (known if wine_key(n) in have else new).append(n)
+    return new, known
+
+
+def merge_into_producer(pid, country, region, sub, wines):
+    """Unisce i vini a un produttore esistente: quelli già presenti restano, si aggiungono solo i nuovi e si completano i campi vuoti."""
+    added = same = 0
+    with db() as c:
+        cur = c.execute("SELECT country, region, subregion FROM producers WHERE id=?", (int(pid),)).fetchone()
+        c.execute("UPDATE producers SET country=?, region=?, subregion=? WHERE id=?",
+                  (*[_txt(old) or _txt(new) for old, new in zip(cur, (country, region, sub))], int(pid)))
+        have = {wine_key(n): (i, t, g) for i, n, t, g in
+                c.execute("SELECT id,name,wine_type,grapes FROM wines WHERE producer_id=?", (int(pid),))}
+        for _, r in wines.iterrows():
+            name, typ, grapes = _txt(r.get("name")), _txt(r.get("wine_type")), _txt(r.get("grapes"))
+            k = wine_key(name)
+            if not k:
+                continue
+            if k in have:
+                same += 1
+                wid, t, g = have[k]
+                if not _txt(t) and typ:
+                    c.execute("UPDATE wines SET wine_type=? WHERE id=?", (typ, wid))
+                if not _txt(g) and grapes:
+                    c.execute("UPDATE wines SET grapes=? WHERE id=?", (grapes, wid))
+            else:
+                wid = c.execute("INSERT INTO wines(producer_id,name,wine_type,grapes) VALUES(?,?,?,?)",
+                                (int(pid), name, typ, grapes)).lastrowid
+                have[k] = (wid, typ, grapes)
+                added += 1
+    return added, same
+
+
 # ───────────────────────── Annata, formato, schede ─────────────────────────
 FORMATS = {"magnum": 1.5, "jeroboam": 3.0, "jéroboam": 3.0, "mathusalem": 6.0, "demi-bouteille": 0.375,
            "demi bouteille": 0.375, "half bottle": 0.375, "mezza bottiglia": 0.375, "halbe flasche": 0.375}
@@ -640,17 +697,27 @@ def producer_form(pid, d, wines, key):
         column_config={"id": None, "name": "Vino",
                        "wine_type": st.column_config.SelectboxColumn("Tipo", options=TYPES),
                        "grapes": "Uve", "verifica": st.column_config.TextColumn("Verifica", disabled=True)})
-    if st.button("💾 Salva", key=f"save{key}", type="primary"):
+    ex = find_producer(name) if pid is None and name.strip() else None
+    if ex:
+        new, known = compare_wines(ex["id"], wines)
+        st.info(f"📎 «{ex['name']}» è già in rubrica. Salvando verranno **aggiunti solo i vini nuovi** ({len(new)}): "
+                f"{', '.join(new) or 'nessuno'}. I {len(known)} vini già presenti restano invariati.")
+    if st.button(f"🔀 Unisci a «{ex['name']}»" if ex else "💾 Salva", key=f"save{key}", type="primary"):
         if not name.strip():
             st.error("Inserisci il nome del produttore.")
         else:
             try:
-                save_producer(pid, name.strip(), country, region, sub, wines)
+                msg = "Salvato ✅"
+                if ex:
+                    added, same = merge_into_producer(ex["id"], country, region, sub, wines)
+                    msg = f"Unito a «{ex['name']}»: {added} vini nuovi aggiunti, {same} già presenti 🔀"
+                else:
+                    save_producer(pid, name.strip(), country, region, sub, wines)
                 autosave()
                 st.session_state.draft = None
                 st.session_state.editing = None
                 st.session_state.tbl_v = st.session_state.get("tbl_v", 0) + 1
-                st.toast("Salvato ✅")
+                st.toast(msg)
                 st.rerun()
             except sqlite3.IntegrityError:
                 st.error("Produttore già presente.")
