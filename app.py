@@ -197,7 +197,7 @@ def secret(k, d=None):
 def autofill_prompt(producer):
     return f"""Sei un sommelier esperto. Per il produttore di vino "{producer}" rispondi SOLO con JSON valido, senza altro testo:
 {{"name":"nome ufficiale","country":"Italia|Francia|Spagna|Germania|Austria|altro","region":"","subregion":"denominazione/sottozona principale","wines":[{{"name":"","wine_type":"rosso|bianco|rosato|spumante|dolce|altro","grapes":"uve separate da virgola"}}]}}
-Elenca i vini principali realmente prodotti dalla cantina (max 15). Non inventare: se non conosci il produttore rispondi {{"error":"sconosciuto"}}."""
+Elenca in ordine alfabetico i vini che la cantina produce realmente (max 15), un'etichetta per riga, senza annata nel nome. Includi SOLO etichette di cui sei certo: se hai dubbi omettile. Non inventare: se non conosci il produttore rispondi {{"error":"sconosciuto"}}."""
 
 
 def parse_json(text):
@@ -470,6 +470,55 @@ def save_offers(wid, sid, res):
                       [(wid, sid, t, p, cu, l, now) for t, p, cu, l in res])
 
 
+# ───────────────────────── Raccolta vini: unione e verifica nei negozi ─────────────────────────
+GENERIC = {"doc", "docg", "igt", "igp", "aoc", "aop", "rosso", "bianco", "rosato", "brut", "riserva", "reserve",
+           "cuvee", "blanc", "rouge", "vino", "vin", "wein", "cru"}
+
+
+def wine_key(name):
+    return " ".join(sorted(t for t in tokens(name) if not t.isdigit()))
+
+
+def merge_wines(old, new):
+    """Aggiunge ai vini già raccolti quelli nuovi (stessa etichetta = stesso vino), senza mai toglierne."""
+    out, seen = list(old), {wine_key(w.get("name") or "") for w in old}
+    for w in new:
+        k = wine_key(w.get("name") or "")
+        if k and k not in seen:
+            seen.add(k)
+            out.append(w)
+    return out
+
+
+def shop_evidence(producer):
+    """Prodotti del produttore trovati nei negozi con ricerca automatica: [(sito, testo normalizzato)]."""
+    shops = q("SELECT * FROM shops WHERE enabled=1 AND auto=1").to_dict("records")
+    ptok = tokens(producer)
+
+    def one(s):
+        if "products.json" in s["url"]:
+            raw, err = shopify_catalog(s["url"])
+        else:
+            html, err = fetch(build_url(s["url"], producer))
+            raw = [] if err else parse(html, s["url"])
+        return [(s["name"], norm(f"{t} {urlparse(l).path}")) for t, p, c, l in raw if matches(norm(f"{t} {l}"), ptok)]
+
+    if not shops:
+        return []
+    with ThreadPoolExecutor(8) as ex:
+        return [x for part in ex.map(one, shops) for x in part]
+
+
+def verify_wines(wines, evidence):
+    """Aggiunge a ogni vino la colonna 'verifica': i negozi in cui compare quell'etichetta."""
+    out = []
+    for w in wines:
+        toks = [t for t in tokens(w.get("name") or "") if not t.isdigit() and t not in GENERIC]
+        sites = sorted({site for site, text in evidence if toks and all(x in text for x in toks)})
+        out.append({**w, "verifica": ("✅ " + ", ".join(sites)) if sites else ("— non trovato" if evidence else "n/d")})
+    return out
+
+
 # ───────────────────────── Annata, formato, schede ─────────────────────────
 FORMATS = {"magnum": 1.5, "jeroboam": 3.0, "jéroboam": 3.0, "mathusalem": 6.0, "demi-bouteille": 0.375,
            "demi bouteille": 0.375, "half bottle": 0.375, "mezza bottiglia": 0.375, "halbe flasche": 0.375}
@@ -590,7 +639,7 @@ def producer_form(pid, d, wines, key):
         wines, num_rows="dynamic", hide_index=True, use_container_width=True, key=f"w{key}",
         column_config={"id": None, "name": "Vino",
                        "wine_type": st.column_config.SelectboxColumn("Tipo", options=TYPES),
-                       "grapes": "Uve"})
+                       "grapes": "Uve", "verifica": st.column_config.TextColumn("Verifica", disabled=True)})
     if st.button("💾 Salva", key=f"save{key}", type="primary"):
         if not name.strip():
             st.error("Inserisci il nome del produttore.")
@@ -605,6 +654,20 @@ def producer_form(pid, d, wines, key):
                 st.rerun()
             except sqlite3.IntegrityError:
                 st.error("Produttore già presente.")
+
+
+def apply_result(name, res):
+    """Aggiunge il risultato all'elenco già raccolto per questo produttore (senza cancellare nulla) e lo verifica nei negozi."""
+    acc = st.session_state.setdefault("af", {}).setdefault(
+        norm(name), {"name": "", "country": "", "region": "", "subregion": "", "wines": []})
+    nd = new_draft(name, res)
+    for k in ("name", "country", "region", "subregion"):
+        acc[k] = acc[k] or nd[k]
+    acc["wines"] = merge_wines(acc["wines"], nd["wines"])
+    with st.spinner("Verifica nei negozi collegati…"):
+        acc["wines"] = verify_wines(acc["wines"], shop_evidence(acc["name"] or name))
+    st.session_state.draft = acc
+    st.session_state.dv += 1
 
 
 st.set_page_config(page_title="Wine Hunter", page_icon="🍷", layout="wide")
@@ -679,23 +742,24 @@ with t1:
 with t2:
     st.session_state.setdefault("dv", 0)
     name = st.text_input("Nome del produttore", key="newname")
-    if st.button("✨ Compila automaticamente", disabled=not name.strip()):
-        draft = {"name": name.strip(), "country": "", "region": "", "subregion": "", "wines": []}
+    acc0 = st.session_state.get("af", {}).get(norm(name))
+    label = "🔄 Cerca altri vini (aggiunge, non cancella)" if acc0 and acc0["wines"] else "✨ Compila automaticamente"
+    if st.button(label, disabled=not name.strip()):
         if not (secret("ANTHROPIC_API_KEY") or secret("GEMINI_API_KEY")):
+            st.session_state.draft = new_draft(name, None)
+            st.session_state.dv += 1
             st.warning("Nessuna chiave API nei Secrets: compila a mano oppure usa «Incolla i dati da una chat» qui sotto.")
         else:
+            res = None
             with st.spinner("Ricerca informazioni…"):
                 try:
                     res = autofill(name)
-                    if res.get("error"):
-                        st.warning("Produttore non riconosciuto: compila a mano.")
-                    else:
-                        draft.update({k: res.get(k, "") for k in ["name", "country", "region", "subregion"]})
-                        draft["wines"] = res.get("wines", [])
                 except Exception as e:
                     st.error(f"Errore: {e}")
-        st.session_state.draft = draft
-        st.session_state.dv += 1
+            if res is not None:
+                if res.get("error"):
+                    st.warning("Produttore non riconosciuto: compila a mano.")
+                apply_result(name, res)
     with st.expander("📋 Senza chiave API: incolla i dati da una chat"):
         if name.strip():
             st.caption("1) Tocca l'icona di copia sul testo qui sotto e incollalo in una chat con Claude (o un altro assistente). "
@@ -706,15 +770,19 @@ with t2:
         pasted = st.text_area("Risposta dell'assistente", key="pasted", height=150)
         if st.button("Usa questi dati", disabled=not (pasted.strip() and name.strip())):
             try:
-                st.session_state.draft = new_draft(name, parse_json(pasted))
-                st.session_state.dv += 1
+                apply_result(name, parse_json(pasted))
                 st.rerun()
             except (AttributeError, ValueError):
                 st.error("Non riesco a leggere la risposta: incolla tutto il testo JSON, dalla prima all'ultima parentesi graffa.")
     d = st.session_state.get("draft")
     if d:
-        st.caption("⚠️ Dati generati da un modello AI: verificali prima di salvare.")
-        wdf = pd.DataFrame(d["wines"], columns=["name", "wine_type", "grapes"])
+        st.caption("⚠️ Dati generati da un modello AI: controlla la colonna «Verifica» prima di salvare.")
+        if d["wines"]:
+            ok = sum(str(w.get("verifica", "")).startswith("✅") for w in d["wines"])
+            st.caption(f"✅ {ok} vini su {len(d['wines'])} confermati da almeno un negozio. «— non trovato» non vuol dire che "
+                       "sia sbagliato: il vino potrebbe non essere in vendita nei siti collegati.")
+        wdf = pd.DataFrame(d["wines"], columns=["name", "wine_type", "grapes", "verifica"])
+        wdf["verifica"] = wdf["verifica"].fillna("")
         wdf["wine_type"] = wdf["wine_type"].where(wdf["wine_type"].isin(TYPES), "altro")
         wdf.insert(0, "id", pd.Series([None] * len(wdf), dtype="float"))
         producer_form(None, d, wdf, f"new{st.session_state.dv}")
