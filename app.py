@@ -8,6 +8,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from html import escape
+from urllib.robotparser import RobotFileParser
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import pandas as pd
@@ -304,6 +305,15 @@ def clean_wine_name(name):
     return n
 
 
+def ask_llm(prompt):
+    if secret("ANTHROPIC_API_KEY"):
+        import anthropic
+        r = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY")).messages.create(
+            model=secret("ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens=2000, messages=[{"role": "user", "content": prompt}])
+        return r.content[0].text
+    return gemini_call(prompt)[0]
+
+
 def new_draft(name, res):
     d = {"name": name.strip(), "country": "", "region": "", "subregion": "", "wines": []}
     if res and not res.get("error"):
@@ -543,14 +553,100 @@ def shop_evidence(producer):
         return [x for part in ex.map(one, shops) for x in part]
 
 
+def sq(s):
+    return " ".join(norm(s).split())
+
+
+def is_confirmed(w):
+    v = str(w.get("verifica", ""))
+    return "✅" in v or "🌐" in v
+
+
 def verify_wines(wines, evidence):
-    """Aggiunge a ogni vino la colonna 'verifica': i negozi in cui compare quell'etichetta."""
+    """Aggiunge a ogni vino la colonna 'verifica': sito ufficiale (🌐) e negozi in cui compare l'etichetta (✅)."""
     out = []
     for w in wines:
         toks = [t for t in tokens(w.get("name") or "") if not t.isdigit() and t not in GENERIC]
         sites = sorted({site for site, text in evidence if toks and all(x in text for x in toks)})
-        out.append({**w, "verifica": ("✅ " + ", ".join(sites)) if sites else ("— non trovato" if evidence else "n/d")})
+        parts = ([f"🌐 {w['official']}"] if w.get("official") else []) + ([f"✅ {', '.join(sites)}"] if sites else [])
+        out.append({**w, "verifica": " · ".join(parts) or ("— non trovato" if evidence else "n/d")})
     return out
+
+
+# ── sito ufficiale del produttore: nomi copiati dal testo originale
+NOT_OFFICIAL = ("wine-searcher", "vivino", "wikipedia", "facebook", "instagram", "tannico", "callmewine", "vinum", "falstaff",
+                "google", "youtube", "tripadvisor", "decanter", "jancisrobinson", "twitter", "linkedin", "pinterest")
+WINE_HINTS = ("wein", "wine", "vin", "vini", "produkt", "sortiment", "etichett", "collection", "range", "cave", "shop")
+
+
+def official_domain(producer, sources):
+    """Tra le pagine consultate sul web, cerca un dominio che contiene il nome del produttore (di solito è il suo sito)."""
+    ptok = [t for t in tokens(producer) if len(t) >= 4]
+    for x in sources:
+        dom = (x.get("title") or "").lower().replace("https://", "").replace("http://", "").strip("/ ")
+        dom = dom.removeprefix("www.")
+        compact = norm(dom).replace(" ", "")
+        if "." in dom and " " not in dom and not any(b in dom for b in NOT_OFFICIAL) and any(t in compact for t in ptok):
+            return dom
+    return None
+
+
+def robots_ok(url):
+    try:
+        r = requests.get("/".join(url.split("/")[:3]) + "/robots.txt", headers=UA, timeout=8)
+        if r.status_code != 200:
+            return True
+        rp = RobotFileParser()
+        rp.parse(r.text.splitlines())
+        return rp.can_fetch(UA["User-Agent"], url)
+    except Exception:
+        return True
+
+
+def site_text(domain, max_pages=6, limit=30000):
+    """Testo della home e di alcune pagine sui vini del sito (rispetta robots.txt)."""
+    home = f"https://{domain}/"
+    todo, seen, texts = [home], set(), []
+    while todo and len(seen) < max_pages:
+        url = todo.pop(0)
+        if url in seen or not robots_ok(url):
+            continue
+        seen.add(url)
+        html, err = fetch(url)
+        if err:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        for t in soup(["script", "style", "noscript"]):
+            t.decompose()
+        texts.append(soup.get_text(" ", strip=True))
+        if url == home:
+            for a in soup.find_all("a", href=True):
+                u = urljoin(url, a["href"]).split("#")[0]
+                if urlparse(u).netloc.removeprefix("www.") == domain.removeprefix("www.") and u not in seen and u not in todo \
+                        and any(h in (u + " " + a.get_text()).lower() for h in WINE_HINTS):
+                    todo.append(u)
+    return " ".join(texts)[:limit]
+
+
+def official_wines(producer, sources):
+    """Etichette copiate dal sito ufficiale: ogni nome deve comparire alla lettera nel testo della pagina. Ritorna (vini, dominio)."""
+    dom = official_domain(producer, sources)
+    if not dom:
+        return [], None
+    text = site_text(dom)
+    if len(text) < 200:
+        return [], dom
+    res = parse_json(ask_llm(
+        f"""Dal testo qui sotto, preso dal sito ufficiale di "{producer}", estrai i nomi delle etichette di vino prodotte. """
+        """COPIA i nomi LETTERALMENTE come appaiono nel testo, senza tradurli né modificarli. Rispondi SOLO con JSON: """
+        """{"wines":[{"name":"","wine_type":"rosso|bianco|rosato|spumante|dolce|altro","grapes":""}]}. """
+        f"""Non aggiungere vini che non compaiono nel testo.\n\nTESTO:\n{text}"""))
+    tn, out = sq(text), []
+    for w in res.get("wines", []) or []:
+        n = clean_wine_name(w.get("name"))
+        if n and sq(n) in tn:
+            out.append({**w, "name": n, "official": dom})
+    return out, dom
 
 
 def producer_key(name):
@@ -758,17 +854,36 @@ def producer_form(pid, d, wines, key):
 
 
 def apply_result(name, res):
-    """Aggiunge il risultato all'elenco già raccolto per questo produttore (senza cancellare nulla) e lo verifica nei negozi."""
+    """Aggiunge il risultato all'elenco già raccolto (senza cancellare nulla). Se trova il sito ufficiale usa i nomi letti lì;
+    i vini proposti dal modello restano solo se confermati da un negozio."""
     acc = st.session_state.setdefault("af", {}).setdefault(
         norm(name), {"name": "", "country": "", "region": "", "subregion": "", "wines": []})
     nd = new_draft(name, res)
     for k in ("name", "country", "region", "subregion"):
         acc[k] = acc[k] or nd[k]
-    acc["wines"] = merge_wines(acc["wines"], nd["wines"])
     known = {x["uri"] for x in acc.setdefault("sources", [])}
     acc["sources"] += [x for x in (res or {}).get("_sources", []) if x["uri"] not in known]
+    producer = acc["name"] or name
+    new_w, dom = nd["wines"], None
+    if (res or {}).get("_sources"):
+        with st.spinner("Leggo il sito ufficiale del produttore…"):
+            try:
+                official, dom = official_wines(producer, res["_sources"])
+            except Exception:
+                official, dom = [], None
+        acc["official"] = dom or acc.get("official")
+        if official:
+            with st.spinner("Verifica nei negozi collegati…"):
+                evidence = shop_evidence(producer)
+            site_keys = {wine_key(w["name"]) for w in official}
+            ai = verify_wines([w for w in new_w if wine_key(w["name"]) not in site_keys], evidence)
+            keep = [w for w in ai if w["verifica"].startswith("✅")]
+            acc.setdefault("discarded", [])
+            acc["discarded"] += [w["name"] for w in ai if w not in keep and w["name"] not in acc["discarded"]]
+            new_w = official + [{k: v for k, v in w.items() if k != "verifica"} for w in keep]
+    acc["wines"] = merge_wines(acc["wines"], new_w)
     with st.spinner("Verifica nei negozi collegati…"):
-        acc["wines"] = verify_wines(acc["wines"], shop_evidence(acc["name"] or name))
+        acc["wines"] = verify_wines(acc["wines"], shop_evidence(producer))
     st.session_state.draft = acc
     st.session_state.dv += 1
 
@@ -893,9 +1008,9 @@ with t2:
             st.session_state.get("af", {}).pop(norm(name), None)
             st.session_state.draft = None
             st.rerun()
-        if any(str(w.get("verifica", "")).startswith("✅") for w in d["wines"]):
+        if any(is_confirmed(w) for w in d["wines"]):
             if b2.button("🧹 Tieni solo i confermati", help="Elimina i vini non trovati in nessun negozio", use_container_width=True):
-                d["wines"] = [w for w in d["wines"] if str(w.get("verifica", "")).startswith("✅")]
+                d["wines"] = [w for w in d["wines"] if is_confirmed(w)]
                 st.session_state.dv += 1
                 st.rerun()
         _q, _p = quote_plus(d["name"]), "+".join(norm(d["name"]).split())
@@ -903,9 +1018,14 @@ with t2:
                     f"[Wine-Searcher](https://www.wine-searcher.com/find/{_p}) · [Vivino](https://www.vivino.com/search/wines?q={_q}) · "
                     f"[Google](https://www.google.com/search?q={_q}+vini) · [Wikipedia](https://it.wikipedia.org/w/index.php?search={_q})")
         if d["wines"]:
-            ok = sum(str(w.get("verifica", "")).startswith("✅") for w in d["wines"])
-            st.caption(f"✅ {ok} vini su {len(d['wines'])} confermati da almeno un negozio. «— non trovato» non vuol dire che "
-                       "sia sbagliato: il vino potrebbe non essere in vendita nei siti collegati.")
+            ok = sum(is_confirmed(w) for w in d["wines"])
+            st.caption(f"✅ {ok} vini su {len(d['wines'])} confermati dal sito ufficiale (🌐) o da un negozio (✅). "
+                       "«— non trovato» non vuol dire che sia sbagliato: il vino potrebbe non essere in vendita nei siti collegati.")
+        if d.get("official"):
+            st.caption(f"🌐 Nomi letti dal sito ufficiale: {d['official']}")
+        if d.get("discarded"):
+            with st.expander(f"🗑️ Scartati dal modello ({len(d['discarded'])}): non sul sito ufficiale né nei negozi"):
+                st.write(", ".join(d["discarded"]))
         wdf = pd.DataFrame(d["wines"], columns=["name", "wine_type", "grapes", "verifica"])
         wdf["verifica"] = wdf["verifica"].fillna("")
         wdf["wine_type"] = wdf["wine_type"].where(wdf["wine_type"].isin(TYPES), "altro")
