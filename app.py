@@ -204,14 +204,39 @@ def parse_json(text):
     return json.loads(re.search(r"\{.*\}", text, re.S).group(0))
 
 
-def gemini_call(prompt):
-    model = secret("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                      headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
-                      json={"contents": [{"parts": [{"text": prompt}]}],
-                            "generationConfig": {"responseMimeType": "application/json"}}, timeout=60)
+GEM = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def gemini_candidates():
+    """Modelli da provare: GEMINI_MODEL se impostato, altrimenti quelli 'flash' disponibili per la tua chiave."""
+    if secret("GEMINI_MODEL"):
+        return [secret("GEMINI_MODEL")]
+    r = requests.get(f"{GEM}/models?pageSize=200", headers={"x-goog-api-key": secret("GEMINI_API_KEY")}, timeout=20)
     r.raise_for_status()
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+             if "generateContent" in m.get("supportedGenerationMethods", [])]
+    bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "native", "thinking", "exp", "deep")
+    cand = [n for n in names if n.startswith("gemini-") and "flash" in n and not any(x in n for x in bad)]
+
+    def rank(n):
+        v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return (not n.endswith("-latest"), "preview" in n, "lite" in n, -(float(v.group(1)) if v else 0))
+    return sorted(cand, key=rank)[:4]
+
+
+def gemini_call(prompt):
+    last, fixed = "nessun modello 'flash' trovato per questa chiave", bool(secret("GEMINI_MODEL"))
+    for model in gemini_candidates():
+        r = requests.post(f"{GEM}/models/{model}:generateContent",
+                          headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
+                          json={"contents": [{"parts": [{"text": prompt}]}],
+                                "generationConfig": {"responseMimeType": "application/json"}}, timeout=60)
+        if r.status_code in (403, 404, 429) and not fixed:  # modello spento o non gratuito: provo il successivo
+            last = f"{model}: errore {r.status_code}"
+            continue
+        r.raise_for_status()
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    raise RuntimeError(f"Nessun modello Gemini utilizzabile ({last}). Controlla la chiave o imposta GEMINI_MODEL nei Secrets.")
 
 
 def autofill(producer):
