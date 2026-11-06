@@ -194,18 +194,48 @@ def secret(k, d=None):
         return d
 
 
-def autofill(producer):
-    key = secret("ANTHROPIC_API_KEY")
-    if not key:
-        return None
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
-    prompt = f"""Sei un sommelier esperto. Per il produttore di vino "{producer}" rispondi SOLO con JSON valido, senza altro testo:
+def autofill_prompt(producer):
+    return f"""Sei un sommelier esperto. Per il produttore di vino "{producer}" rispondi SOLO con JSON valido, senza altro testo:
 {{"name":"nome ufficiale","country":"Italia|Francia|Spagna|Germania|Austria|altro","region":"","subregion":"denominazione/sottozona principale","wines":[{{"name":"","wine_type":"rosso|bianco|rosato|spumante|dolce|altro","grapes":"uve separate da virgola"}}]}}
 Elenca i vini principali realmente prodotti dalla cantina (max 15). Non inventare: se non conosci il produttore rispondi {{"error":"sconosciuto"}}."""
-    r = client.messages.create(model=secret("ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens=1500,
-                               messages=[{"role": "user", "content": prompt}])
-    return json.loads(re.search(r"\{.*\}", r.content[0].text, re.S).group(0))
+
+
+def parse_json(text):
+    return json.loads(re.search(r"\{.*\}", text, re.S).group(0))
+
+
+def gemini_call(prompt):
+    model = secret("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                      headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
+                      json={"contents": [{"parts": [{"text": prompt}]}],
+                            "generationConfig": {"responseMimeType": "application/json"}}, timeout=60)
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def autofill(producer):
+    """Compila i dati con Claude (ANTHROPIC_API_KEY) o con Gemini gratuito (GEMINI_API_KEY). None se nessuna chiave."""
+    prompt = autofill_prompt(producer)
+    if secret("ANTHROPIC_API_KEY"):
+        import anthropic
+        client = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY"))
+        r = client.messages.create(model=secret("ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens=1500,
+                                   messages=[{"role": "user", "content": prompt}])
+        text = r.content[0].text
+    elif secret("GEMINI_API_KEY"):
+        text = gemini_call(prompt)
+    else:
+        return None
+    return parse_json(text)
+
+
+def new_draft(name, res):
+    d = {"name": name.strip(), "country": "", "region": "", "subregion": "", "wines": []}
+    if res and not res.get("error"):
+        d.update({k: res.get(k, "") or "" for k in ["name", "country", "region", "subregion"]})
+        d["wines"] = res.get("wines", []) or []
+    return d
 
 
 # ───────────────────────── Ricerca offerte ─────────────────────────
@@ -548,8 +578,8 @@ with t2:
     name = st.text_input("Nome del produttore", key="newname")
     if st.button("✨ Compila automaticamente", disabled=not name.strip()):
         draft = {"name": name.strip(), "country": "", "region": "", "subregion": "", "wines": []}
-        if not secret("ANTHROPIC_API_KEY"):
-            st.warning("Nessuna ANTHROPIC_API_KEY nei secrets: compila i campi a mano.")
+        if not (secret("ANTHROPIC_API_KEY") or secret("GEMINI_API_KEY")):
+            st.warning("Nessuna chiave API nei Secrets: compila a mano oppure usa «Incolla i dati da una chat» qui sotto.")
         else:
             with st.spinner("Ricerca informazioni…"):
                 try:
@@ -563,6 +593,21 @@ with t2:
                     st.error(f"Errore: {e}")
         st.session_state.draft = draft
         st.session_state.dv += 1
+    with st.expander("📋 Senza chiave API: incolla i dati da una chat"):
+        if name.strip():
+            st.caption("1) Tocca l'icona di copia sul testo qui sotto e incollalo in una chat con Claude (o un altro assistente). "
+                       "2) Copia la risposta e incollala nel riquadro.")
+            st.code(autofill_prompt(name.strip()), language=None)
+        else:
+            st.caption("Scrivi prima il nome del produttore.")
+        pasted = st.text_area("Risposta dell'assistente", key="pasted", height=150)
+        if st.button("Usa questi dati", disabled=not (pasted.strip() and name.strip())):
+            try:
+                st.session_state.draft = new_draft(name, parse_json(pasted))
+                st.session_state.dv += 1
+                st.rerun()
+            except (AttributeError, ValueError):
+                st.error("Non riesco a leggere la risposta: incolla tutto il testo JSON, dalla prima all'ultima parentesi graffa.")
     d = st.session_state.get("draft")
     if d:
         st.caption("⚠️ Dati generati da un modello AI: verificali prima di salvare.")
