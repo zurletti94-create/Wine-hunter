@@ -194,14 +194,17 @@ def secret(k, d=None):
         return d
 
 
-def autofill_prompt(producer):
+def autofill_prompt(producer, web=False):
+    extra = ("Usa la ricerca web (sito ufficiale del produttore, guide e negozi specializzati) per verificare le etichette: "
+             "includi solo vini che trovi in fonti affidabili. " if web else "")
     return f"""Sei un sommelier esperto. Per il produttore di vino "{producer}" rispondi SOLO con JSON valido, senza altro testo:
 {{"name":"nome ufficiale","country":"Italia|Francia|Spagna|Germania|Austria|altro","region":"","subregion":"denominazione/sottozona principale","wines":[{{"name":"","wine_type":"rosso|bianco|rosato|spumante|dolce|altro","grapes":"uve separate da virgola"}}]}}
-Elenca in ordine alfabetico i vini che la cantina produce realmente (max 15), un'etichetta per riga, senza annata nel nome. Includi SOLO etichette di cui sei certo: se hai dubbi omettile. Non inventare: se non conosci il produttore rispondi {{"error":"sconosciuto"}}."""
+{extra}Elenca in ordine alfabetico i vini che la cantina produce realmente (max 15), un'etichetta per riga, senza annata nel nome. Includi SOLO etichette di cui sei certo: se hai dubbi omettile. Non inventare: se non conosci il produttore rispondi {{"error":"sconosciuto"}}."""
 
 
 def parse_json(text):
-    return json.loads(re.search(r"\{.*\}", text, re.S).group(0))
+    """Legge il primo oggetto JSON nel testo (ignora recinzioni ``` e commenti prima o dopo)."""
+    return json.JSONDecoder().raw_decode(text[text.index("{"):])[0]
 
 
 GEM = "https://generativelanguage.googleapis.com/v1beta"
@@ -224,21 +227,25 @@ def gemini_candidates():
     return sorted(cand, key=rank)[:4]
 
 
-def gemini_call(prompt):
+def gemini_call(prompt, grounded=False):
+    """Ritorna (testo, fonti). grounded=True attiva la ricerca Google di Gemini e restituisce le pagine consultate."""
     last, fixed = "nessun modello 'flash' trovato per questa chiave", bool(secret("GEMINI_MODEL"))
     try:
         models = gemini_candidates()
     except requests.exceptions.RequestException:
         raise RuntimeError("Google non risponde in questo momento: riprova tra un minuto.")
-    for model in models:
+    for model in (models[:2] if grounded else models):
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        if grounded:
+            body["tools"] = [{"google_search": {}}]
+        else:
+            body["generationConfig"] = {"responseMimeType": "application/json"}
         r = None
         for attempt in range(2):  # un secondo tentativo se Google è momentaneamente sovraccarico
             try:
                 r = requests.post(f"{GEM}/models/{model}:generateContent",
                                   headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
-                                  json={"contents": [{"parts": [{"text": prompt}]}],
-                                        "generationConfig": {"responseMimeType": "application/json"}},
-                                  timeout=(10, 30))
+                                  json=body, timeout=(10, 60 if grounded else 30))
             except requests.exceptions.RequestException:  # nessuna risposta in tempo: passo al modello successivo
                 r = None
                 break
@@ -252,25 +259,37 @@ def gemini_call(prompt):
                 break
             continue
         r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        cand = r.json()["candidates"][0]
+        text = "".join(p.get("text", "") for p in cand["content"]["parts"])
+        chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
+        sources = [{"title": c["web"].get("title", ""), "uri": c["web"]["uri"]} for c in chunks if c.get("web", {}).get("uri")]
+        return text, sources
     raise RuntimeError(f"Gemini non ha risposto ({last}). Riprova tra un minuto; "
                        "altrimenti usa «Incolla i dati da una chat» oppure controlla chiave e modello nei Secrets.")
 
 
-def autofill(producer):
-    """Compila i dati con Claude (ANTHROPIC_API_KEY) o con Gemini gratuito (GEMINI_API_KEY). None se nessuna chiave."""
-    prompt = autofill_prompt(producer)
+def autofill(producer, web=False):
+    """Compila i dati con Claude (ANTHROPIC_API_KEY) o Gemini (GEMINI_API_KEY). Con web=True Gemini cerca anche su Google
+    e il risultato include '_sources'. Se la ricerca web non funziona, ripiega sulla sola memoria del modello."""
     if secret("ANTHROPIC_API_KEY"):
         import anthropic
         client = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY"))
         r = client.messages.create(model=secret("ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens=1500,
-                                   messages=[{"role": "user", "content": prompt}])
-        text = r.content[0].text
-    elif secret("GEMINI_API_KEY"):
-        text = gemini_call(prompt)
-    else:
-        return None
-    return parse_json(text)
+                                   messages=[{"role": "user", "content": autofill_prompt(producer)}])
+        return parse_json(r.content[0].text)
+    if secret("GEMINI_API_KEY"):
+        res, sources = None, []
+        if web:
+            try:
+                text, sources = gemini_call(autofill_prompt(producer, web=True), grounded=True)
+                res = parse_json(text)
+            except Exception:
+                res, sources = None, []
+        if res is None:
+            res = parse_json(gemini_call(autofill_prompt(producer))[0])
+        res["_sources"] = sources
+        return res
+    return None
 
 
 def new_draft(name, res):
@@ -731,6 +750,8 @@ def apply_result(name, res):
     for k in ("name", "country", "region", "subregion"):
         acc[k] = acc[k] or nd[k]
     acc["wines"] = merge_wines(acc["wines"], nd["wines"])
+    known = {x["uri"] for x in acc.setdefault("sources", [])}
+    acc["sources"] += [x for x in (res or {}).get("_sources", []) if x["uri"] not in known]
     with st.spinner("Verifica nei negozi collegati…"):
         acc["wines"] = verify_wines(acc["wines"], shop_evidence(acc["name"] or name))
     st.session_state.draft = acc
@@ -809,6 +830,7 @@ with t1:
 with t2:
     st.session_state.setdefault("dv", 0)
     name = st.text_input("Nome del produttore", key="newname")
+    use_web = st.toggle("🌐 Cerca anche sul web (più lento, con fonti)", value=True, key="use_web")
     acc0 = st.session_state.get("af", {}).get(norm(name))
     label = "🔄 Cerca altri vini (aggiunge, non cancella)" if acc0 and acc0["wines"] else "✨ Compila automaticamente"
     if st.button(label, disabled=not name.strip()):
@@ -818,9 +840,9 @@ with t2:
             st.warning("Nessuna chiave API nei Secrets: compila a mano oppure usa «Incolla i dati da una chat» qui sotto.")
         else:
             res = None
-            with st.spinner("Ricerca informazioni…"):
+            with st.spinner("Ricerca informazioni… (con la ricerca web può richiedere fino a un minuto)"):
                 try:
-                    res = autofill(name)
+                    res = autofill(name, web=use_web)
                 except Exception as e:
                     st.error(f"Errore: {e}")
             if res is not None:
@@ -844,6 +866,17 @@ with t2:
     d = st.session_state.get("draft")
     if d:
         st.caption("⚠️ Dati generati da un modello AI: controlla la colonna «Verifica» prima di salvare.")
+        srcs = d.get("sources", [])
+        if srcs:
+            with st.expander(f"🔗 Fonti consultate sul web ({len(srcs)})"):
+                st.markdown("\n".join("- [" + (x["title"] or x["uri"]).replace("[", "(").replace("]", ")") + "](" + x["uri"] + ")"
+                                      for x in srcs[:15]))
+        else:
+            st.caption("ℹ️ Nessuna fonte web per questo elenco: viene dalla memoria del modello.")
+        _q, _p = quote_plus(d["name"]), "+".join(norm(d["name"]).split())
+        st.markdown("🔎 **Controlla a mano:** "
+                    f"[Wine-Searcher](https://www.wine-searcher.com/find/{_p}) · [Vivino](https://www.vivino.com/search/wines?q={_q}) · "
+                    f"[Google](https://www.google.com/search?q={_q}+vini) · [Wikipedia](https://it.wikipedia.org/w/index.php?search={_q})")
         if d["wines"]:
             ok = sum(str(w.get("verifica", "")).startswith("✅") for w in d["wines"])
             st.caption(f"✅ {ok} vini su {len(d['wines'])} confermati da almeno un negozio. «— non trovato» non vuol dire che "
