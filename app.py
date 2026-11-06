@@ -199,7 +199,8 @@ def autofill_prompt(producer, web=False):
              "includi solo vini che trovi in fonti affidabili. " if web else "")
     return f"""Sei un sommelier esperto. Per il produttore di vino "{producer}" rispondi SOLO con JSON valido, senza altro testo:
 {{"name":"nome ufficiale","country":"Italia|Francia|Spagna|Germania|Austria|altro","region":"","subregion":"denominazione/sottozona principale","wines":[{{"name":"","wine_type":"rosso|bianco|rosato|spumante|dolce|altro","grapes":"uve separate da virgola"}}]}}
-{extra}Elenca in ordine alfabetico i vini che la cantina produce realmente (max 15), un'etichetta per riga, senza annata nel nome. Includi SOLO etichette di cui sei certo: se hai dubbi omettile. Non inventare: se non conosci il produttore rispondi {{"error":"sconosciuto"}}."""
+{extra}Elenca in ordine alfabetico i vini che la cantina produce realmente (max 15), un'etichetta per riga, senza annata nel nome. Includi SOLO etichette di cui sei certo: se hai dubbi omettile. Non inventare: se non conosci il produttore rispondi {{"error":"sconosciuto"}}.
+REGOLE SUI NOMI: scrivi ogni etichetta esattamente come compare sulla bottiglia, nella lingua originale del produttore (per un produttore austriaco o tedesco: in tedesco, con umlaut e ß). NON tradurre mai i nomi, NON usare equivalenti in inglese o in altre lingue, NON usare ideogrammi o altri alfabeti, NON aggiungere traduzioni tra parentesi. Anche se le fonti sono in inglese, riporta il nome originale. Un vino = una sola voce: non elencare la stessa etichetta con nomi diversi. Se non conosci il nome originale esatto, omettila."""
 
 
 def parse_json(text):
@@ -292,11 +293,25 @@ def autofill(producer, web=False):
     return None
 
 
+def clean_wine_name(name):
+    """Toglie traduzioni tra parentesi, varianti dopo / o |, annata finale; scarta i nomi con alfabeti non latini (es. cinese)."""
+    n = re.sub(r"\s*[\(\[].*?[\)\]]", "", str(name or ""))
+    n = n.split(" / ")[0].split(" | ")[0]
+    n = re.sub(r"\s+(19|20)\d{2}$", "", n.strip()).strip(" -–,;")
+    letters = [ch for ch in n if ch.isalpha()]
+    if not letters or any(not unicodedata.name(ch, "").startswith("LATIN") for ch in letters):
+        return ""
+    return n
+
+
 def new_draft(name, res):
     d = {"name": name.strip(), "country": "", "region": "", "subregion": "", "wines": []}
     if res and not res.get("error"):
         d.update({k: res.get(k, "") or "" for k in ["name", "country", "region", "subregion"]})
-        d["wines"] = res.get("wines", []) or []
+        for w in res.get("wines", []) or []:
+            n = clean_wine_name(w.get("name"))
+            if n:
+                d["wines"].append({**w, "name": n})
     return d
 
 
@@ -873,6 +888,16 @@ with t2:
                                       for x in srcs[:15]))
         else:
             st.caption("ℹ️ Nessuna fonte web per questo elenco: viene dalla memoria del modello.")
+        b1, b2 = st.columns(2)
+        if b1.button("🧽 Ricomincia da capo", help="Cancella l'elenco raccolto finora per questo produttore", use_container_width=True):
+            st.session_state.get("af", {}).pop(norm(name), None)
+            st.session_state.draft = None
+            st.rerun()
+        if any(str(w.get("verifica", "")).startswith("✅") for w in d["wines"]):
+            if b2.button("🧹 Tieni solo i confermati", help="Elimina i vini non trovati in nessun negozio", use_container_width=True):
+                d["wines"] = [w for w in d["wines"] if str(w.get("verifica", "")).startswith("✅")]
+                st.session_state.dv += 1
+                st.rerun()
         _q, _p = quote_plus(d["name"]), "+".join(norm(d["name"]).split())
         st.markdown("🔎 **Controlla a mano:** "
                     f"[Wine-Searcher](https://www.wine-searcher.com/find/{_p}) · [Vivino](https://www.vivino.com/search/wines?q={_q}) · "
