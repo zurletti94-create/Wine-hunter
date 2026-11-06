@@ -226,25 +226,35 @@ def gemini_candidates():
 
 def gemini_call(prompt):
     last, fixed = "nessun modello 'flash' trovato per questa chiave", bool(secret("GEMINI_MODEL"))
-    for model in gemini_candidates():
+    try:
+        models = gemini_candidates()
+    except requests.exceptions.RequestException:
+        raise RuntimeError("Google non risponde in questo momento: riprova tra un minuto.")
+    for model in models:
+        r = None
         for attempt in range(2):  # un secondo tentativo se Google è momentaneamente sovraccarico
-            r = requests.post(f"{GEM}/models/{model}:generateContent",
-                              headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
-                              json={"contents": [{"parts": [{"text": prompt}]}],
-                                    "generationConfig": {"responseMimeType": "application/json"}}, timeout=60)
+            try:
+                r = requests.post(f"{GEM}/models/{model}:generateContent",
+                                  headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
+                                  json={"contents": [{"parts": [{"text": prompt}]}],
+                                        "generationConfig": {"responseMimeType": "application/json"}},
+                                  timeout=(10, 30))
+            except requests.exceptions.RequestException:  # nessuna risposta in tempo: passo al modello successivo
+                r = None
+                break
             if r.status_code in (500, 502, 503, 504) and attempt == 0:
                 time.sleep(2)
                 continue
             break
-        if r.status_code in (403, 404, 429, 500, 502, 503, 504):  # spento, non gratuito, limite o sovraccarico
-            last = f"{model}: errore {r.status_code}"
+        if r is None or r.status_code in (403, 404, 429, 500, 502, 503, 504):
+            last = f"{model}: " + ("nessuna risposta in tempo" if r is None else f"errore {r.status_code}")
             if fixed:
                 break
             continue
         r.raise_for_status()
         return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    raise RuntimeError(f"Gemini non ha risposto ({last}). Con errori 503 o 429 riprova tra un minuto; "
-                       "altrimenti controlla la chiave o il modello nei Secrets.")
+    raise RuntimeError(f"Gemini non ha risposto ({last}). Riprova tra un minuto; "
+                       "altrimenti usa «Incolla i dati da una chat» oppure controlla chiave e modello nei Secrets.")
 
 
 def autofill(producer):
