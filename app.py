@@ -542,6 +542,33 @@ button[kind="primary"]:hover,button[data-testid="stBaseButton-primary"]:hover{ba
 </style>"""
 
 
+def producers_summary():
+    """Un record per produttore, con numero di vini e testo di ricerca."""
+    return q("""SELECT p.id, p.name, p.country, p.region, p.subregion, COUNT(w.id) AS n,
+                COALESCE(GROUP_CONCAT(w.name || ' ' || COALESCE(w.grapes, '') || ' ' || COALESCE(w.wine_type, ''), ' '), '') AS hay
+                FROM producers p LEFT JOIN wines w ON w.producer_id = p.id
+                GROUP BY p.id ORDER BY p.name COLLATE NOCASE""")
+
+
+def zone_of(r):
+    return " · ".join(str(x) for x in (r["country"], r["region"], r["subregion"]) if x)
+
+
+def filter_producers(prod, txt):
+    words = norm(txt).split()
+    if not words:
+        return prod.reset_index(drop=True)
+    hay = (prod["name"].fillna("") + " " + prod["country"].fillna("") + " " + prod["region"].fillna("") + " "
+           + prod["subregion"].fillna("") + " " + prod["hay"]).map(norm)
+    return prod[hay.map(lambda h: all(w in h for w in words))].reset_index(drop=True)
+
+
+def delete_producer(pid):
+    with db() as c:
+        c.execute("DELETE FROM producers WHERE id=?", (int(pid),))  # elimina anche vini e offerte collegati
+    autosave()
+
+
 # ───────────────────────── UI ─────────────────────────
 def producer_form(pid, d, wines, key):
     name = st.text_input("Produttore", d["name"], key=f"n{key}")
@@ -554,8 +581,7 @@ def producer_form(pid, d, wines, key):
         column_config={"id": None, "name": "Vino",
                        "wine_type": st.column_config.SelectboxColumn("Tipo", options=TYPES),
                        "grapes": "Uve"})
-    b1, b2 = st.columns(2)
-    if b1.button("💾 Salva", key=f"save{key}", type="primary"):
+    if st.button("💾 Salva", key=f"save{key}", type="primary"):
         if not name.strip():
             st.error("Inserisci il nome del produttore.")
         else:
@@ -563,15 +589,12 @@ def producer_form(pid, d, wines, key):
                 save_producer(pid, name.strip(), country, region, sub, wines)
                 autosave()
                 st.session_state.draft = None
+                st.session_state.editing = None
+                st.session_state.tbl_v = st.session_state.get("tbl_v", 0) + 1
                 st.toast("Salvato ✅")
                 st.rerun()
             except sqlite3.IntegrityError:
                 st.error("Produttore già presente.")
-    if pid and b2.button("🗑️ Elimina", key=f"del{key}"):
-        with db() as c:
-            c.execute("DELETE FROM producers WHERE id=?", (int(pid),))
-        autosave()
-        st.rerun()
 
 
 st.set_page_config(page_title="Wine Hunter", page_icon="🍷", layout="wide")
@@ -587,23 +610,60 @@ t1, t2, t3, t4, t5 = st.tabs(["📒 Rubrica", "➕ Nuovo", "🛒 Offerte", "🌐
 
 # ── Rubrica
 with t1:
-    prod = q("SELECT * FROM producers ORDER BY name")
+    for k, v in (("tbl_v", 0), ("editing", None), ("confirm_del", None)):
+        st.session_state.setdefault(k, v)
+    prod = producers_summary()
     if prod.empty:
         st.info("Rubrica vuota: aggiungi un produttore dalla scheda ➕ Nuovo.")
     else:
-        full = q("""SELECT p.name Produttore, p.country Paese, p.region Regione, p.subregion Sottoregione,
-                    w.name Vino, w.wine_type Tipo, w.grapes Uve
-                    FROM producers p LEFT JOIN wines w ON w.producer_id=p.id ORDER BY p.name, w.name""")
-        txt = st.text_input("🔎 Cerca")
-        if txt:
-            full = full[full.apply(lambda r: txt.lower() in " ".join(map(str, r)).lower(), axis=1)]
-        st.dataframe(full, use_container_width=True, hide_index=True)
-        st.divider()
-        sel = st.selectbox("✏️ Modifica produttore", prod["name"])
-        row = prod[prod["name"] == sel].iloc[0]
-        wdf = q("SELECT id,name,wine_type,grapes FROM wines WHERE producer_id=? ORDER BY name", (int(row["id"]),))
-        producer_form(int(row["id"]), {k: row[k] or "" for k in ["name", "country", "region", "subregion"]},
-                      wdf, f"e{row['id']}")
+        txt = st.text_input("🔎 Cerca produttore, vino, uva o regione")
+        view = filter_producers(prod, txt)
+        st.caption(f"{len(view)} produttori · tocca una riga per vedere i vini")
+        if view.empty:
+            st.info("Nessun risultato.")
+            row = None
+        else:
+            table = pd.DataFrame({"Produttore": view["name"], "Zona": view.apply(zone_of, axis=1), "Vini": view["n"]})
+            ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun",
+                              selection_mode="single-row", key=f"ptbl_{st.session_state.tbl_v}_{txt.strip()}",
+                              column_config={"Vini": st.column_config.NumberColumn("Vini", width="small")})
+            pick = st.selectbox("…oppure scegli dall'elenco", list(view["name"]), index=None,
+                                placeholder="Scegli un produttore", key=f"psel_{st.session_state.tbl_v}")
+            sel = ev.selection.rows
+            row = view.iloc[sel[0]] if sel else (view[view["name"] == pick].iloc[0] if pick else None)
+        if row is not None:
+            pid = int(row["id"])
+            wdf = q("SELECT id,name,wine_type,grapes FROM wines WHERE producer_id=? ORDER BY name", (pid,))
+            st.divider()
+            st.markdown(f"### {row['name']}")
+            st.caption(zone_of(row) or "Zona non indicata")
+            if wdf.empty:
+                st.info("Nessun vino registrato per questo produttore.")
+            else:
+                st.dataframe(wdf.rename(columns={"name": "Vino", "wine_type": "Tipo", "grapes": "Uve"})[["Vino", "Tipo", "Uve"]],
+                             hide_index=True, use_container_width=True)
+            c1, c2 = st.columns(2)
+            if c1.button("✏️ Modifica", key=f"ed{pid}", use_container_width=True):
+                st.session_state.editing, st.session_state.confirm_del = pid, None
+            if c2.button("🗑️ Elimina", key=f"rm{pid}", use_container_width=True):
+                st.session_state.confirm_del, st.session_state.editing = pid, None
+            if st.session_state.confirm_del == pid:
+                st.warning(f"Eliminare «{row['name']}», i suoi {len(wdf)} vini e le offerte collegate? L'operazione non si può annullare.")
+                y, n = st.columns(2)
+                if y.button("Sì, elimina", key=f"yes{pid}", type="primary", use_container_width=True):
+                    delete_producer(pid)
+                    st.session_state.confirm_del = None
+                    st.session_state.tbl_v += 1
+                    st.toast("Produttore eliminato 🗑️")
+                    st.rerun()
+                if n.button("Annulla", key=f"no{pid}", use_container_width=True):
+                    st.session_state.confirm_del = None
+                    st.rerun()
+            if st.session_state.editing == pid:
+                producer_form(pid, {k: row[k] or "" for k in ["name", "country", "region", "subregion"]}, wdf, f"e{pid}")
+                if st.button("✖ Chiudi modifica", key=f"cl{pid}"):
+                    st.session_state.editing = None
+                    st.rerun()
 
 # ── Nuovo produttore
 with t2:
