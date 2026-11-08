@@ -50,12 +50,15 @@ def q(sql, p=()):
 def init():
     with db() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS producers(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, region TEXT, notes TEXT);
-        CREATE TABLE IF NOT EXISTS styles(id INTEGER PRIMARY KEY, producer_id INTEGER REFERENCES producers(id) ON DELETE CASCADE, type TEXT, grape TEXT);
+        CREATE TABLE IF NOT EXISTS producers(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, region TEXT, subregion TEXT, notes TEXT);
+        CREATE TABLE IF NOT EXISTS styles(id INTEGER PRIMARY KEY, producer_id INTEGER REFERENCES producers(id) ON DELETE CASCADE, type TEXT, grape TEXT, wine TEXT);
         CREATE TABLE IF NOT EXISTS shops(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, url TEXT);
         CREATE TABLE IF NOT EXISTS avail(producer_id INTEGER REFERENCES producers(id) ON DELETE CASCADE,
                                          shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE, PRIMARY KEY(producer_id, shop_id));
         """)
+        for table, col in (("producers", "subregion"), ("styles", "wine")):  # database creati con la versione precedente
+            if col not in [r[1] for r in c.execute(f"PRAGMA table_info({table})")]:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
 
 def secret(k, d=None):
@@ -141,13 +144,22 @@ def pkey(name):
 
 
 def load_all():
-    prods = q("SELECT id,name,country,region,notes FROM producers ORDER BY name COLLATE NOCASE").to_dict("records")
-    by = {p["id"]: {**p, "country": p["country"] or "", "region": p["region"] or "", "notes": p["notes"] or "", "styles": [], "sites": []} for p in prods}
-    for r in q("SELECT producer_id,type,grape FROM styles ORDER BY id").to_dict("records"):
-        by[r["producer_id"]]["styles"].append((r["type"] or "", r["grape"] or ""))
+    """Produttori con 'styles' = elenco di (tipo, uva, nome del vino) e 'sites' = siti assegnati."""
+    prods = q("SELECT id,name,country,region,subregion,notes FROM producers ORDER BY name COLLATE NOCASE").to_dict("records")
+    by = {p["id"]: {**p, **{k: p[k] or "" for k in ("country", "region", "subregion", "notes")}, "styles": [], "sites": []} for p in prods}
+    for r in q("SELECT producer_id,type,grape,wine FROM styles ORDER BY id").to_dict("records"):
+        by[r["producer_id"]]["styles"].append((r["type"] or "", r["grape"] or "", r["wine"] or ""))
     for r in q("SELECT a.producer_id, s.name FROM avail a JOIN shops s ON s.id=a.shop_id ORDER BY s.name COLLATE NOCASE").to_dict("records"):
         by[r["producer_id"]]["sites"].append(r["name"])
     return list(by.values())
+
+
+def zone_of(p):
+    return " · ".join(x for x in (p["country"], p["region"], p["subregion"]) if x)
+
+
+def styles_text(p, with_wine=False):
+    return ", ".join(" ".join(x for x in ((w if with_wine else ""), t, g) if x) for t, g, w in p["styles"] if t or g or (with_wine and w))
 
 
 def find_producer(name, allp):
@@ -155,24 +167,27 @@ def find_producer(name, allp):
     return next((p for p in allp if pkey(p["name"]) == k), None)
 
 
-def save_producer(pid, name, country, region, notes, styles, sites, merge_into=None):
-    """Nuovo: crea. Esistente (pid): sostituisce. merge_into: unisce a un produttore già presente senza togliere nulla."""
-    styles = [(t.strip(), g.strip()) for t, g in styles if t.strip() or g.strip()]
+def save_producer(pid, name, country, region, subregion, notes, styles, sites, merge_into=None):
+    """Nuovo: crea. Esistente (pid): sostituisce. merge_into: unisce a un produttore già presente senza togliere nulla.
+    styles = elenco di (tipo, uva, nome del vino)."""
+    styles = [(t.strip(), g.strip(), w.strip()) for t, g, w in styles if t.strip() or g.strip() or w.strip()]
     with db() as c:
         if merge_into:
             pid = merge_into
-            cur = c.execute("SELECT country, region, notes FROM producers WHERE id=?", (pid,)).fetchone()
-            c.execute("UPDATE producers SET country=?, region=?, notes=? WHERE id=?",
-                      (cur[0] or country, cur[1] or region, cur[2] or notes, pid))
-            have = {(norm(t), norm(g)) for t, g in c.execute("SELECT type, grape FROM styles WHERE producer_id=?", (pid,))}
-            styles = [(t, g) for t, g in styles if (norm(t), norm(g)) not in have]
+            cur = c.execute("SELECT country, region, subregion, notes FROM producers WHERE id=?", (pid,)).fetchone()
+            c.execute("UPDATE producers SET country=?, region=?, subregion=?, notes=? WHERE id=?",
+                      (cur[0] or country, cur[1] or region, cur[2] or subregion, cur[3] or notes, pid))
+            have = {(norm(t), norm(g), norm(w)) for t, g, w in c.execute("SELECT type, grape, wine FROM styles WHERE producer_id=?", (pid,))}
+            styles = [x for x in styles if tuple(norm(v) for v in x) not in have]
         elif pid is None:
-            pid = c.execute("INSERT INTO producers(name,country,region,notes) VALUES(?,?,?,?)", (name, country, region, notes)).lastrowid
+            pid = c.execute("INSERT INTO producers(name,country,region,subregion,notes) VALUES(?,?,?,?,?)",
+                            (name, country, region, subregion, notes)).lastrowid
         else:
-            c.execute("UPDATE producers SET name=?, country=?, region=?, notes=? WHERE id=?", (name, country, region, notes, pid))
+            c.execute("UPDATE producers SET name=?, country=?, region=?, subregion=?, notes=? WHERE id=?",
+                      (name, country, region, subregion, notes, pid))
             c.execute("DELETE FROM styles WHERE producer_id=?", (pid,))
             c.execute("DELETE FROM avail WHERE producer_id=?", (pid,))
-        c.executemany("INSERT INTO styles(producer_id,type,grape) VALUES(?,?,?)", [(pid, t, g) for t, g in styles])
+        c.executemany("INSERT INTO styles(producer_id,type,grape,wine) VALUES(?,?,?,?)", [(pid, *x) for x in styles])
         for s in sites:
             row = c.execute("SELECT id FROM shops WHERE name=?", (s,)).fetchone()
             if row:
@@ -215,6 +230,7 @@ def read_old_xlsx(raw):
     header = [norm(x) for x in df.iloc[hr]]
     idx = lambda pat: {int(re.findall(r"\d+", h)[0]) if re.search(r"\d", h) else 0: i for i, h in enumerate(header) if re.fullmatch(pat, h)}
     col_c, col_r, col_p = idx("paese").get(0), idx("regione").get(0), idx("produttore").get(0)
+    col_s = idx(r"sotto ?regione|subregione|provincia").get(0)
     types, grapes, sites_c = idx(r"tipo \d+"), idx(r"uva \d+"), idx(r"sito \d+")
     fixes, canon_sites, canon_regions = {}, [], []
     note = lambda k: fixes.__setitem__(k, fixes.get(k, 0) + 1)
@@ -247,21 +263,22 @@ def read_old_xlsx(raw):
             continue
         country = clean(r.iloc[col_c], "c", KNOWN_COUNTRIES, 0.75) if col_c is not None else ""
         region = clean(r.iloc[col_r], "r", canon_regions, 0.85) if col_r is not None else ""
+        sub = _cl(r.iloc[col_s]) if col_s is not None else ""
         styles = []
         for n, ti in sorted(types.items()):
             t, g = _cl(r.iloc[ti]).capitalize(), _cl(r.iloc[grapes[n]]) if n in grapes else ""
             if t or g:
-                styles.append((t, g))
+                styles.append((t, g, ""))
         sites = [s for s in (clean(r.iloc[i], "site", canon_sites, 0.85) for _, i in sorted(sites_c.items())) if s]
         k = pkey(name)
         if k in by_key:  # stesso produttore inserito due volte: unisco
             p = by_key[k]
             p["styles"] += [x for x in styles if x not in p["styles"]]
             p["sites"] += [x for x in sites if x not in p["sites"]]
-            p["country"], p["region"] = p["country"] or country, p["region"] or region
+            p["country"], p["region"], p["subregion"] = p["country"] or country, p["region"] or region, p["subregion"] or sub
             note(f"produttore doppio unito: {p['name']}")
         else:
-            by_key[k] = {"name": name, "country": country, "region": region, "styles": styles, "sites": sites}
+            by_key[k] = {"name": name, "country": country, "region": region, "subregion": sub, "styles": styles, "sites": sites}
             rows.append(by_key[k])
         used += sites
     shops = list(dict.fromkeys(canon_sites + used))
@@ -275,7 +292,7 @@ def import_rows(rows, shops):
     added = merged = 0
     for p in rows:
         ex = find_producer(p["name"], allp)
-        save_producer(None, p["name"], p["country"], p["region"], "", p["styles"], p["sites"], merge_into=ex["id"] if ex else None)
+        save_producer(None, p["name"], p["country"], p["region"], p["subregion"], "", p["styles"], p["sites"], merge_into=ex["id"] if ex else None)
         merged, added = merged + bool(ex), added + (not ex)
         allp = load_all() if not ex else allp
     return added, merged
@@ -286,9 +303,10 @@ def export_df():
     ns, nt = max([len(p["sites"]) for p in allp] + [3]), max([len(p["styles"]) for p in allp] + [2])
     out = []
     for p in allp:
-        row = {"Paese": p["country"], "Regione": p["region"], "Produttore": p["name"]}
+        row = {"Paese": p["country"], "Regione": p["region"], "Sottoregione": p["subregion"], "Produttore": p["name"]}
         for i in range(nt):
-            row[f"Tipo {i + 1}"], row[f"Uva {i + 1}"] = (p["styles"][i] if i < len(p["styles"]) else ("", ""))
+            t, g, w = p["styles"][i] if i < len(p["styles"]) else ("", "", "")
+            row[f"Tipo {i + 1}"], row[f"Uva {i + 1}"], row[f"Vino {i + 1}"] = t, g, w
         for i in range(ns):
             row[f"Sito {i + 1}"] = p["sites"][i] if i < len(p["sites"]) else ""
         row["Note"] = p["notes"]
@@ -309,8 +327,8 @@ def shop_link(shop, text):
 
 
 def pcard(p, shop):
-    zone = " · ".join(x for x in (p["country"], p["region"]) if x) or "—"
-    chips = "".join(f"<span>{escape(t)}{' · ' + escape(g) if g else ''}</span>" for t, g in p["styles"])
+    zone = zone_of(p) or "—"
+    chips = "".join(f"<span>{escape(t)}{' · ' + escape(g) if t and g else escape(g)}</span>" for t, g, _ in p["styles"] if t or g)
     others = [s for s in p["sites"] if not shop or s != shop["name"]]
     also = f'<div class="wh-note">Anche su: {escape(", ".join(others))}</div>' if others else ""
     return (f'<div class="wh-card"><div class="wh-prod">{escape(zone)}</div><div class="wh-wine">{escape(p["name"])}</div>'
@@ -358,22 +376,24 @@ def producer_form(pid, allp, shops):
     c1, c2 = st.columns(2)
     country = pick(c1, "Paese", [p["country"] for p in allp] + KNOWN_COUNTRIES, cur["country"] if cur else "", k + "c")
     region = pick(c2, "Regione", [p["region"] for p in allp], cur["region"] if cur else "", k + "r")
-    types = sorted({t for p in allp for t, _ in p["styles"] if t} | set(BASE_TYPES))
-    sdf = st.data_editor(pd.DataFrame(cur["styles"] if cur else [], columns=["Tipo", "Uva"]), num_rows="dynamic", hide_index=True,
-                         use_container_width=True, key=k + "s",
-                         column_config={"Tipo": st.column_config.SelectboxColumn("Tipo", options=types), "Uva": "Uva"})
+    subregion = pick(st, "Provincia / sotto-regione", [p["subregion"] for p in allp], cur["subregion"] if cur else "", k + "p")
+    types = sorted({t for p in allp for t, _, _ in p["styles"] if t} | set(BASE_TYPES))
+    st.markdown("**Vini**")
+    wdf = pd.DataFrame([(w, t, g) for t, g, w in cur["styles"]] if cur else [], columns=["Vino", "Tipo", "Uva"])
+    wdf = st.data_editor(wdf, num_rows="dynamic", hide_index=True, use_container_width=True, key=k + "s",
+                         column_config={"Vino": "Vino", "Tipo": st.column_config.SelectboxColumn("Tipo", options=types), "Uva": "Uva"})
     sites = st.multiselect("🛒 Siti dove hai verificato che li trovi", [s["name"] for s in shops], default=cur["sites"] if cur else [], key=k + "w")
     notes = st.text_area("Note", cur["notes"] if cur else "", key=k + "t", height=80)
     ex = find_producer(name, allp) if not pid and name.strip() else None
     if ex:
-        st.info(f"📎 «{ex['name']}» è già in rubrica: salvando verranno aggiunti solo tipi/uve e siti nuovi, senza togliere nulla.")
+        st.info(f"📎 «{ex['name']}» è già in rubrica: salvando verranno aggiunti solo vini e siti nuovi, senza togliere nulla.")
     if st.button(f"🔀 Unisci a «{ex['name']}»" if ex else "💾 Salva", key=k + "b", type="primary"):
         if not name.strip():
             st.error("Inserisci il nome del produttore.")
         else:
             try:
-                styles = [(_cl(t), _cl(g)) for t, g in sdf[["Tipo", "Uva"]].itertuples(index=False)]
-                save_producer(pid, name.strip(), country, region, notes.strip(), styles, sites, merge_into=ex["id"] if ex else None)
+                styles = [(_cl(t), _cl(g), _cl(w)) for w, t, g in wdf[["Vino", "Tipo", "Uva"]].itertuples(index=False)]
+                save_producer(pid, name.strip(), country, region, subregion, notes.strip(), styles, sites, merge_into=ex["id"] if ex else None)
                 autosave()
                 st.session_state.fv += 1
                 st.session_state.tv += 1
@@ -416,11 +436,12 @@ with t1:
             txt = st.text_input("Cerca produttore")
             f_c = st.multiselect("Paese", sorted({p["country"] for p in items if p["country"]}))
             f_r = st.multiselect("Regione", sorted({p["region"] for p in items if p["region"]}))
-            f_t = st.multiselect("Tipo", sorted({t for p in items for t, _ in p["styles"] if t}))
-            f_u = st.multiselect("Uva", sorted({g for p in items for _, g in p["styles"] if g}))
+            f_s = st.multiselect("Provincia / sotto-regione", sorted({p["subregion"] for p in items if p["subregion"]}))
+            f_t = st.multiselect("Tipo", sorted({t for p in items for t, _, _ in p["styles"] if t}))
+            f_u = st.multiselect("Uva", sorted({g for p in items for _, g, _ in p["styles"] if g}))
         items = [p for p in items if (not txt or norm(txt) in norm(p["name"])) and (not f_c or p["country"] in f_c)
-                 and (not f_r or p["region"] in f_r) and (not f_t or any(t in f_t for t, _ in p["styles"]))
-                 and (not f_u or any(g in f_u for _, g in p["styles"]))]
+                 and (not f_r or p["region"] in f_r) and (not f_s or p["subregion"] in f_s)
+                 and (not f_t or any(t in f_t for t, _, _ in p["styles"])) and (not f_u or any(g in f_u for _, g, _ in p["styles"]))]
         st.caption(f"{len(items)} produttori")
         if items:
             st.markdown('<div class="wh-grid">' + "".join(pcard(p, shop) for p in items) + "</div>", unsafe_allow_html=True)
@@ -435,12 +456,12 @@ with t2:
     else:
         txt = st.text_input("🔎 Cerca per produttore, regione, uva o sito", key="ps")
         words = norm(txt).split()
-        view = [p for p in allp if all(w in norm(" ".join([p["name"], p["country"], p["region"], *p["sites"], *(f"{t} {g}" for t, g in p["styles"])])) for w in words)]
+        view = [p for p in allp if all(w in norm(" ".join([p["name"], p["country"], p["region"], p["subregion"], *p["sites"], *(f"{w} {t} {g}" for t, g, w in p["styles"])])) for w in words)]
         st.caption(f"{len(view)} produttori · tocca una riga per aprire la scheda")
         if view:
             table = pd.DataFrame({"Produttore": [p["name"] for p in view],
-                                  "Zona": [" · ".join(x for x in (p["country"], p["region"]) if x) for p in view],
-                                  "Tipi e uve": [", ".join(f"{t} {g}".strip() for t, g in p["styles"]) for p in view],
+                                  "Zona": [zone_of(p) for p in view],
+                                  "Tipi e uve": [styles_text(p) for p in view],
                                   "Siti": [", ".join(p["sites"]) for p in view]})
             ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row",
                               key=f"ptbl_{st.session_state.tv}_{txt.strip()}")
@@ -512,8 +533,8 @@ with t4:
             st.caption(f"{len(rows)} produttori ({sum(pkey(r['name']) not in known for r in rows)} nuovi) · {len(new_shops)} siti")
             if fixes:
                 st.info("Correzioni automatiche: " + "; ".join(fixes))
-            st.dataframe(pd.DataFrame([{"Produttore": r["name"], "Paese": r["country"], "Regione": r["region"],
-                                        "Tipi e uve": ", ".join(f"{t} {g}".strip() for t, g in r["styles"]), "Siti": ", ".join(r["sites"]),
+            st.dataframe(pd.DataFrame([{"Produttore": r["name"], "Paese": r["country"], "Regione": r["region"], "Sotto-regione": r["subregion"],
+                                        "Tipi e uve": styles_text(r), "Siti": ", ".join(r["sites"]),
                                         "Stato": "già presente (unito)" if pkey(r["name"]) in known else "nuovo"} for r in rows]),
                          hide_index=True, use_container_width=True)
             if st.button("📥 Importa", type="primary"):
