@@ -1,5 +1,4 @@
 streamlit
 pandas
 requests
-beautifulsoup4
-anthropic
+openpyxl

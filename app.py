@@ -1,49 +1,35 @@
 import base64
+import io
 import json
 import re
 import sqlite3
-import threading
-import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from difflib import get_close_matches
 from html import escape
-from urllib.robotparser import RobotFileParser
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
 
-DB = "wine.db"
-UA = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-    "Accept-Language": "it,en;q=0.8,fr;q=0.6,de;q=0.6,es;q=0.6",
+DB, GH_FILE = "cantina.db", "cantina_data.json"
+TABLES = ["producers", "styles", "shops", "avail"]
+KNOWN_COUNTRIES = ["Francia", "Italia", "Spagna", "Germania", "Austria", "Portogallo", "Svizzera", "Slovenia", "Grecia", "Ungheria", "USA"]
+BASE_TYPES = ["Bianco", "Rosso", "Rosato", "Bolla", "Arancione", "Dolce"]
+STOP = {"domaine", "chateau", "maison", "tenuta", "cantina", "azienda", "agricola", "weingut", "bodega", "bodegas", "fattoria",
+        "podere", "castello", "marchesi", "famiglia", "vini", "winery", "estate", "des", "les", "del", "della", "dei", "von"}
+# Siti che conosco già: (paese, indirizzo di ricerca con {q}). Gli altri li completi nella scheda Siti.
+KNOWN_SHOPS = {
+    "vinossimo": ("Francia", "https://vinossimo.com/recherche?controller=search&s={q}"),
+    "versus": ("", "https://www.versus.wine/catalogue?searchQuery={q}"),
+    "caves carrier": ("Francia", "https://www.caves-carriere.fr/recherche?s={q}"),
+    "buveur de vin": ("Francia", "https://buveurdevin.com/?s={q}&post_type=product"),
+    "wine rl": ("Austria", "https://www.winerl.com/en/#8b1f/mobile/m=and&q={q}"),
+    "weinfurore": ("Germania", "https://www.weinfurore.de/?qs={q}"),
+    "kierdorfwein": ("Germania", "https://www.kierdorfwein.de/search?keywords={q}&page=search&page_action=query"),
+    "restaurant cave la pepiniere": ("Francia", "https://restaurant-cave-lapepiniere.com/search?q={q}&type=product"),
 }
-COUNTRIES = ["Italia", "Francia", "Spagna", "Germania", "Austria"]
-TYPES = ["rosso", "bianco", "rosato", "spumante", "dolce", "altro"]
-STOP = {"cantina", "cantine", "azienda", "agricola", "tenuta", "fattoria", "podere", "castello",
-        "marchesi", "domaine", "chateau", "maison", "bodega", "bodegas", "weingut", "winery",
-        "estate", "famiglia", "vini", "vigneti", "des", "les", "del", "della", "dei", "von"}
-
-# Siti di partenza: (nome, paese, URL di ricerca con {q}, attivo, ricerca automatica).
-# auto=0: solo link manuali (il sito vieta l'accesso automatico, oppure cerca via JavaScript).
-SHOPS_VERSION = 6
-OLD_DEFAULTS = ["Millésima", "Vinatis", "Vinissimus", "Bodeboca", "Weinfreunde", "Hawesko", "Wein & Co"]
-DEFAULT_SHOPS = [
-    ("Tannico", "Italia", "https://www.tannico.it/search?q={q}", 1, 1),
-    ("Callmewine", "Italia", "https://www.callmewine.com/search?query={q}", 1, 1),
-    ("Gino Frutta & Bistrot", "Italia", "https://ginofruttabistrot.it/?s={q}&post_type=product", 1, 1),
-    ("Vinossimo", "Francia", "https://vinossimo.com/recherche?controller=search&s={q}", 1, 0),
-    ("Buveur de vin", "Francia", "https://buveurdevin.com/?s={q}&post_type=product", 1, 1),
-    ("La Pépinière", "Francia", "https://restaurant-cave-lapepiniere.com/products.json", 1, 1),
-    ("Les Zinzins du Vin", "Francia", "https://www.leszinzinsduvin.com/vins.php", 0, 0),  # il sito non ha ricerca
-    ("Kierdorf Wein", "Germania", "https://www.kierdorfwein.de/search?keywords={q}&page=search&page_action=query", 1, 0),
-    ("Weinfurore", "Germania", "https://www.weinfurore.de/?qs={q}", 1, 0),
-    ("Winerl", "Austria", "https://www.winerl.com/en/#8b1f/mobile/m=and&q={q}", 1, 0),
-    ("Versus", "Italia", "https://www.versus.wine/catalogue?searchQuery={q}", 1, 0),  # paese da confermare
-]
 
 
 # ───────────────────────── Database ─────────────────────────
@@ -64,63 +50,24 @@ def q(sql, p=()):
 def init():
     with db() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS producers(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, region TEXT, subregion TEXT);
-        CREATE TABLE IF NOT EXISTS wines(id INTEGER PRIMARY KEY, producer_id INTEGER REFERENCES producers(id) ON DELETE CASCADE, name TEXT, wine_type TEXT, grapes TEXT);
-        CREATE TABLE IF NOT EXISTS shops(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, url TEXT, enabled INTEGER DEFAULT 1, auto INTEGER DEFAULT 1);
-        CREATE TABLE IF NOT EXISTS offers(id INTEGER PRIMARY KEY, wine_id INTEGER REFERENCES wines(id) ON DELETE CASCADE, shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE, title TEXT, price REAL, currency TEXT, link TEXT, found TEXT);
+        CREATE TABLE IF NOT EXISTS producers(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, region TEXT, notes TEXT);
+        CREATE TABLE IF NOT EXISTS styles(id INTEGER PRIMARY KEY, producer_id INTEGER REFERENCES producers(id) ON DELETE CASCADE, type TEXT, grape TEXT);
+        CREATE TABLE IF NOT EXISTS shops(id INTEGER PRIMARY KEY, name TEXT UNIQUE, country TEXT, url TEXT);
+        CREATE TABLE IF NOT EXISTS avail(producer_id INTEGER REFERENCES producers(id) ON DELETE CASCADE,
+                                         shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE, PRIMARY KEY(producer_id, shop_id));
         """)
-        if "auto" not in [r[1] for r in c.execute("PRAGMA table_info(shops)")]:
-            c.execute("ALTER TABLE shops ADD COLUMN auto INTEGER DEFAULT 1")
-        if c.execute("PRAGMA user_version").fetchone()[0] < SHOPS_VERSION:
-            c.executemany("DELETE FROM shops WHERE name=?", [(n,) for n in OLD_DEFAULTS])
-            c.executemany("INSERT INTO shops(name,country,url,enabled,auto) VALUES(?,?,?,?,?) "
-                          "ON CONFLICT(name) DO UPDATE SET country=excluded.country, url=excluded.url, enabled=excluded.enabled, auto=excluded.auto",
-                          DEFAULT_SHOPS)
-            c.execute(f"PRAGMA user_version={SHOPS_VERSION}")
 
 
-def sync_rows(c, table, parent_col, parent_id, df, cols):
-    """Allinea una tabella figlia a un data_editor (id NaN = nuova riga)."""
-    keep = [int(i) for i in df["id"].dropna()] or [-1]
-    where, args = (f"{parent_col}=? AND " if parent_col else ""), ([parent_id] if parent_col else [])
-    c.execute(f"DELETE FROM {table} WHERE {where}id NOT IN ({','.join('?' * len(keep))})", args + keep)
-    for _, r in df.iterrows():
-        vals = [("" if pd.isna(r[k]) else r[k]) for k in cols]
-        if not str(vals[0]).strip():
-            continue
-        if pd.notna(r["id"]):
-            c.execute(f"UPDATE {table} SET {','.join(k + '=?' for k in cols)} WHERE id=?", vals + [int(r["id"])])
-        elif parent_col:
-            c.execute(f"INSERT INTO {table}({parent_col},{','.join(cols)}) VALUES(?,{','.join('?' * len(cols))})",
-                      [parent_id] + vals)
-        else:
-            c.execute(f"INSERT INTO {table}({','.join(cols)}) VALUES({','.join('?' * len(cols))})", vals)
-
-
-def save_producer(pid, name, country, region, sub, wines):
-    with db() as c:
-        if pid is None:
-            pid = c.execute("INSERT INTO producers(name,country,region,subregion) VALUES(?,?,?,?)",
-                            (name, country, region, sub)).lastrowid
-        else:
-            c.execute("UPDATE producers SET name=?,country=?,region=?,subregion=? WHERE id=?",
-                      (name, country, region, sub, pid))
-        sync_rows(c, "wines", "producer_id", pid, wines, ["name", "wine_type", "grapes"])
+def secret(k, d=None):
+    try:
+        return st.secrets.get(k, d)
+    except Exception:
+        return d
 
 
 # ───────────────────────── Salvataggio permanente (repository GitHub privato) ─────────────────────────
-TABLES = ["producers", "wines", "shops", "offers"]
-GH = "https://api.github.com"
-
-
 def dump():
-    data = {t: q(f"SELECT * FROM {t}").to_dict("records") for t in TABLES}
-    con = db()
-    try:
-        data["meta"] = {"shops_version": con.execute("PRAGMA user_version").fetchone()[0]}
-    finally:
-        con.close()
-    return data
+    return {t: q(f"SELECT * FROM {t}").to_dict("records") for t in TABLES}
 
 
 def restore(data):
@@ -131,7 +78,6 @@ def restore(data):
             df = pd.DataFrame(data.get(t, []))
             if not df.empty:
                 df.to_sql(t, c, if_exists="append", index=False)
-        c.execute(f"PRAGMA user_version={int(data.get('meta', {}).get('shops_version', 0))}")
 
 
 def gh_conf():
@@ -142,7 +88,7 @@ def gh_conf():
 def gh_call(method, accept="application/vnd.github+json", **kw):
     tok, repo = gh_conf()
     h = {"Authorization": f"Bearer {tok}", "Accept": accept, "X-GitHub-Api-Version": "2022-11-28"}
-    return requests.request(method, f"{GH}/repos/{repo}/contents/wine_data.json", headers=h, timeout=30, **kw)
+    return requests.request(method, f"https://api.github.com/repos/{repo}/contents/{GH_FILE}", headers=h, timeout=30, **kw)
 
 
 def pull_backup():
@@ -159,7 +105,6 @@ def pull_backup():
 
 
 def push_backup():
-    """Salva tutti i dati su GitHub. None = non configurato, True/False = riuscito o no."""
     if not gh_conf():
         return None
     try:
@@ -180,583 +125,196 @@ def autosave():
 
 @st.cache_resource
 def first_boot():
-    """Una volta per ogni avvio dell'app: se il database è vuoto, ripristina i dati da GitHub."""
-    if q("SELECT 1 FROM producers LIMIT 1").empty and pull_backup():
-        init()
-        return True
-    return False
+    """Una volta per avvio: se il database è vuoto, ripristina i dati da GitHub."""
+    return q("SELECT 1 FROM producers LIMIT 1").empty and pull_backup()
 
 
-# ───────────────────────── Compilazione automatica (LLM) ─────────────────────────
-def secret(k, d=None):
-    try:
-        return st.secrets.get(k, d)
-    except Exception:
-        return d
-
-
-def autofill_prompt(producer, web=False):
-    extra = ("Usa la ricerca web (sito ufficiale del produttore, guide e negozi specializzati) per verificare le etichette: "
-             "includi solo vini che trovi in fonti affidabili. " if web else "")
-    return f"""Sei un sommelier esperto. Per il produttore di vino "{producer}" rispondi SOLO con JSON valido, senza altro testo:
-{{"name":"nome ufficiale","country":"Italia|Francia|Spagna|Germania|Austria|altro","region":"","subregion":"denominazione/sottozona principale","wines":[{{"name":"","wine_type":"rosso|bianco|rosato|spumante|dolce|altro","grapes":"uve separate da virgola"}}]}}
-{extra}Elenca in ordine alfabetico i vini che la cantina produce realmente (max 15), un'etichetta per riga, senza annata nel nome. Includi SOLO etichette di cui sei certo: se hai dubbi omettile. Non inventare: se non conosci il produttore rispondi {{"error":"sconosciuto"}}.
-REGOLE SUI NOMI: scrivi ogni etichetta esattamente come compare sulla bottiglia, nella lingua originale del produttore (per un produttore austriaco o tedesco: in tedesco, con umlaut e ß). NON tradurre mai i nomi, NON usare equivalenti in inglese o in altre lingue, NON usare ideogrammi o altri alfabeti, NON aggiungere traduzioni tra parentesi. Anche se le fonti sono in inglese, riporta il nome originale. Un vino = una sola voce: non elencare la stessa etichetta con nomi diversi. Se non conosci il nome originale esatto, omettila."""
-
-
-def parse_json(text):
-    """Legge il primo oggetto JSON nel testo (ignora recinzioni ``` e commenti prima o dopo)."""
-    return json.JSONDecoder().raw_decode(text[text.index("{"):])[0]
-
-
-GEM = "https://generativelanguage.googleapis.com/v1beta"
-
-
-def gemini_candidates():
-    """Modelli da provare: GEMINI_MODEL se impostato, altrimenti quelli 'flash' disponibili per la tua chiave."""
-    if secret("GEMINI_MODEL"):
-        return [secret("GEMINI_MODEL")]
-    r = requests.get(f"{GEM}/models?pageSize=200", headers={"x-goog-api-key": secret("GEMINI_API_KEY")}, timeout=20)
-    r.raise_for_status()
-    names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
-             if "generateContent" in m.get("supportedGenerationMethods", [])]
-    bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "native", "thinking", "exp", "deep")
-    cand = [n for n in names if n.startswith("gemini-") and "flash" in n and not any(x in n for x in bad)]
-
-    def rank(n):
-        v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
-        return (not n.endswith("-latest"), "preview" in n, "lite" in n, -(float(v.group(1)) if v else 0))
-    return sorted(cand, key=rank)[:4]
-
-
-def gemini_call(prompt, grounded=False):
-    """Ritorna (testo, fonti). grounded=True attiva la ricerca Google di Gemini e restituisce le pagine consultate."""
-    last, fixed = "nessun modello 'flash' trovato per questa chiave", bool(secret("GEMINI_MODEL"))
-    try:
-        models = gemini_candidates()
-    except requests.exceptions.RequestException:
-        raise RuntimeError("Google non risponde in questo momento: riprova tra un minuto.")
-    for model in (models[:2] if grounded else models):
-        body = {"contents": [{"parts": [{"text": prompt}]}]}
-        if grounded:
-            body["tools"] = [{"google_search": {}}]
-        else:
-            body["generationConfig"] = {"responseMimeType": "application/json"}
-        r = None
-        for attempt in range(2):  # un secondo tentativo se Google è momentaneamente sovraccarico
-            try:
-                r = requests.post(f"{GEM}/models/{model}:generateContent",
-                                  headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
-                                  json=body, timeout=(10, 60 if grounded else 30))
-            except requests.exceptions.RequestException:  # nessuna risposta in tempo: passo al modello successivo
-                r = None
-                break
-            if r.status_code in (500, 502, 503, 504) and attempt == 0:
-                time.sleep(2)
-                continue
-            break
-        if r is None or r.status_code in (403, 404, 429, 500, 502, 503, 504):
-            last = f"{model}: " + ("nessuna risposta in tempo" if r is None else f"errore {r.status_code}")
-            if fixed:
-                break
-            continue
-        r.raise_for_status()
-        cand = r.json()["candidates"][0]
-        text = "".join(p.get("text", "") for p in cand["content"]["parts"])
-        chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
-        sources = [{"title": c["web"].get("title", ""), "uri": c["web"]["uri"]} for c in chunks if c.get("web", {}).get("uri")]
-        return text, sources
-    raise RuntimeError(f"Gemini non ha risposto ({last}). Riprova tra un minuto; "
-                       "altrimenti usa «Incolla i dati da una chat» oppure controlla chiave e modello nei Secrets.")
-
-
-def autofill(producer, web=False):
-    """Compila i dati con Claude (ANTHROPIC_API_KEY) o Gemini (GEMINI_API_KEY). Con web=True Gemini cerca anche su Google
-    e il risultato include '_sources'. Se la ricerca web non funziona, ripiega sulla sola memoria del modello."""
-    if secret("ANTHROPIC_API_KEY"):
-        import anthropic
-        client = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY"))
-        r = client.messages.create(model=secret("ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens=1500,
-                                   messages=[{"role": "user", "content": autofill_prompt(producer)}])
-        return parse_json(r.content[0].text)
-    if secret("GEMINI_API_KEY"):
-        res, sources = None, []
-        if web:
-            try:
-                text, sources = gemini_call(autofill_prompt(producer, web=True), grounded=True)
-                res = parse_json(text)
-            except Exception:
-                res, sources = None, []
-        if res is None:
-            res = parse_json(gemini_call(autofill_prompt(producer))[0])
-        res["_sources"] = sources
-        return res
-    return None
-
-
-def clean_wine_name(name):
-    """Toglie traduzioni tra parentesi, varianti dopo / o |, annata finale; scarta i nomi con alfabeti non latini (es. cinese)."""
-    n = re.sub(r"\s*[\(\[].*?[\)\]]", "", str(name or ""))
-    n = n.split(" / ")[0].split(" | ")[0]
-    n = re.sub(r"\s+(19|20)\d{2}$", "", n.strip()).strip(" -–,;")
-    letters = [ch for ch in n if ch.isalpha()]
-    if not letters or any(not unicodedata.name(ch, "").startswith("LATIN") for ch in letters):
-        return ""
-    return n
-
-
-def ask_llm(prompt):
-    if secret("ANTHROPIC_API_KEY"):
-        import anthropic
-        r = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY")).messages.create(
-            model=secret("ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens=2000, messages=[{"role": "user", "content": prompt}])
-        return r.content[0].text
-    return gemini_call(prompt)[0]
-
-
-def new_draft(name, res):
-    d = {"name": name.strip(), "country": "", "region": "", "subregion": "", "wines": []}
-    if res and not res.get("error"):
-        d.update({k: res.get(k, "") or "" for k in ["name", "country", "region", "subregion"]})
-        for w in res.get("wines", []) or []:
-            n = clean_wine_name(w.get("name"))
-            if n:
-                d["wines"].append({**w, "name": n})
-    return d
-
-
-# ───────────────────────── Ricerca offerte ─────────────────────────
-PRICE = re.compile(r"(?:€|EUR)\s?(\d{1,4}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)|(\d{1,4}(?:[.,]\d{1,2})?)\s?(?:€|EUR)")
-
-
+# ───────────────────────── Dati ─────────────────────────
 def norm(s):
-    return re.sub(r"[^a-z0-9 ]", " ", unicodedata.normalize("NFKD", str(s).lower()).encode("ascii", "ignore").decode())
+    s = unicodedata.normalize("NFKD", str(s or "").lower()).encode("ascii", "ignore").decode()
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", s).split())
 
 
-def tokens(s):
-    return [t for t in norm(s).split() if len(t) > 2 and t not in STOP]
+def pkey(name):
+    """Chiave per riconoscere lo stesso produttore (ignora maiuscole, accenti, ordine e parole come Domaine/Tenuta)."""
+    return " ".join(sorted(t for t in norm(name).split() if len(t) > 2 and t not in STOP)) or norm(name)
 
 
-def to_float(s):
-    s = str(s).strip()
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
-    else:
-        s = s.replace(",", ".")
-    try:
-        return float(s)
-    except ValueError:
-        return None
+def load_all():
+    prods = q("SELECT id,name,country,region,notes FROM producers ORDER BY name COLLATE NOCASE").to_dict("records")
+    by = {p["id"]: {**p, "country": p["country"] or "", "region": p["region"] or "", "notes": p["notes"] or "", "styles": [], "sites": []} for p in prods}
+    for r in q("SELECT producer_id,type,grape FROM styles ORDER BY id").to_dict("records"):
+        by[r["producer_id"]]["styles"].append((r["type"] or "", r["grape"] or ""))
+    for r in q("SELECT a.producer_id, s.name FROM avail a JOIN shops s ON s.id=a.shop_id ORDER BY s.name COLLATE NOCASE").to_dict("records"):
+        by[r["producer_id"]]["sites"].append(r["name"])
+    return list(by.values())
 
 
-def build_url(tpl, text, fragment=False):
-    """Inserisce il testo cercato. fragment=True tiene il #frammento (serve ai link manuali dei siti con ricerca JavaScript)."""
-    tpl = tpl.strip()
-    had_q = "{q}" in tpl
-    if not fragment:
-        tpl = tpl.split("#")[0]
-    if "products.json" in tpl:  # negozio Shopify letto via catalogo: il link manuale usa la ricerca del sito
-        tpl = "/".join(tpl.split("/")[:3]) + "/search?q={q}"
-    if "{q}" not in tpl and not had_q:  # se {q} era solo nel #frammento, la ricerca via server non è possibile
-        tpl += "{q}"
-    return tpl.replace("{q}", quote_plus(text))
+def find_producer(name, allp):
+    k = pkey(name)
+    return next((p for p in allp if pkey(p["name"]) == k), None)
 
 
-def fetch(url):
-    try:
-        with requests.Session() as sess:
-            sess.headers.update(UA)
-            sess.headers["Referer"] = "/".join(url.split("/")[:3]) + "/"
-            r = sess.get(url, timeout=15)
-            r.raise_for_status()
-            return r.text, None
-    except Exception as e:
-        return None, str(e)[:100]
-
-
-def _parse(html, base):
-    """Estrae (titolo, prezzo, valuta, link): prima da JSON-LD schema.org, poi euristica sui link."""
-    soup, out = BeautifulSoup(html, "html.parser"), []
-
-    def walk(o):
-        if isinstance(o, list):
-            for i in o:
-                walk(i)
-        elif isinstance(o, dict):
-            t = o.get("@type")
-            if t == "Product" or (isinstance(t, list) and "Product" in t):
-                off = o.get("offers") or {}
-                off = (off[0] if off else {}) if isinstance(off, list) else off
-                p = off.get("price") or off.get("lowPrice")
-                if p and o.get("name"):
-                    out.append((o["name"], to_float(p), off.get("priceCurrency", "EUR"),
-                                urljoin(base, o.get("url") or off.get("url") or base)))
-            for v in o.values():
-                if isinstance(v, (dict, list)):
-                    walk(v)
-
-    for s in soup.find_all("script", type="application/ld+json"):
-        try:
-            walk(json.loads(s.string or ""))
-        except Exception:
-            pass
-    if out:
-        return out
-    for a in soup.find_all("a", href=True):
-        title = a.get_text(" ", strip=True)
-        if len(title) < 8 or norm(title) in BUTTONS:
-            continue
-        box, m = a, None
-        for _ in range(4):
-            if box is None:
-                break
-            txt = box.get_text(" ", strip=True)
-            if len(txt) > 600:
-                break
-            m = PRICE.search(txt)
-            if m:
-                break
-            box = box.parent
-        if m:
-            out.append((title, to_float(m.group(1) or m.group(2)), "EUR", urljoin(base, a["href"])))
-    return out
-
-
-# Testi dei pulsanti dei negozi: non sono nomi di prodotti
-BUTTONS = {"ajouter au panier", "lire la suite", "choix des options", "add to cart", "read more", "select options",
-           "aggiungi al carrello", "leggi tutto", "scegli le opzioni", "in den warenkorb", "weiterlesen",
-           "mehr erfahren", "anadir al carrito", "leer mas", "voir le produit", "acquista ora", "acquista",
-           "dettagli", "details", "buy now", "quick view", "vedi prodotto", "zum produkt"}
-
-
-def parse(html, base):
-    """Come _parse, ma elimina i duplicati (stesso prodotto trovato da più link: titolo, immagine, pulsante)."""
-    out, seen = [], set()
-    for title, price, cur, link in _parse(html, base):
-        u = urlparse(link)
-        key = f"{u.netloc}{u.path}" if len(u.path.strip("/")) > 3 else link
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((title, price, cur, link))
-    return out
-
-
-_CAT, _LOCK = {}, threading.Lock()
-
-
-def shopify_catalog(url):
-    """Negozi Shopify: scarica una volta (cache 30 min) l'elenco prodotti da /products.json."""
-    with _LOCK:
-        hit = _CAT.get(url)
-        if hit and time.time() - hit[0] < 1800:
-            return hit[1], hit[2]
-        origin, items, err = "/".join(url.split("/")[:3]), [], None
-        for page in range(1, 9):
-            txt, err = fetch(f"{origin}/products.json?limit=250&page={page}")
-            if err:
-                break
-            try:
-                prods = json.loads(txt).get("products", [])
-            except Exception:
-                err = "risposta non valida (catalogo non pubblico?)"
-                break
-            for p in prods:
-                vs = p.get("variants", [])
-                ok = [v for v in vs if v.get("available")]
-                prices = [to_float(v.get("price")) for v in (ok or vs)]
-                prices = [x for x in prices if x]
-                if prices:
-                    title = f'{p.get("title", "")} - {p.get("vendor", "")}' + ("" if ok else " (non disponibile)")
-                    items.append((title, min(prices), "EUR", f'{origin}/products/{p.get("handle", "")}'))
-            if len(prods) < 250:
-                break
-        err = err if not items else None
-        _CAT[url] = (time.time(), items, err)
-        return items, err
-
-
-def matches(text, toks, strict=True):
-    """strict: servono tutte le parole (o quasi, se sono molte); altrimenti ne basta una."""
-    if not toks:
-        return True
-    hits = sum(x in text for x in toks)
-    if not strict:
-        return hits >= 1
-    return hits >= (len(toks) if len(toks) <= 3 else len(toks) - 1)
-
-
-def search_one(w, s):
-    if "products.json" in s["url"]:
-        raw, err = shopify_catalog(s["url"])
-    else:
-        html, err = fetch(build_url(s["url"], f'{w["producer"]} {w["wine"]}'))
-        raw = [] if err else parse(html, s["url"])
-    if err:
-        return w["wine_id"], s["id"], [], f'{s["name"]}: {err}', 0
-    ptok, wtok, res, seen = tokens(w["producer"]), tokens(w["wine"]), [], set()
-    for title, price, cur, link in raw:
-        t = norm(f"{title} {link}")  # titolo + indirizzo del prodotto (di solito contiene produttore e vino)
-        if price is None or not 3 <= price <= 20000 or link in seen:
-            continue
-        if not matches(t, ptok) or not matches(t, wtok, strict=False):
-            continue
-        seen.add(link)
-        res.append((title[:200], price, cur, link))
-    return w["wine_id"], s["id"], res, None, len(raw)
-
-
-def save_offers(wid, sid, res):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+def save_producer(pid, name, country, region, notes, styles, sites, merge_into=None):
+    """Nuovo: crea. Esistente (pid): sostituisce. merge_into: unisce a un produttore già presente senza togliere nulla."""
+    styles = [(t.strip(), g.strip()) for t, g in styles if t.strip() or g.strip()]
     with db() as c:
-        c.execute("DELETE FROM offers WHERE wine_id=? AND shop_id=?", (wid, sid))
-        c.executemany("INSERT INTO offers(wine_id,shop_id,title,price,currency,link,found) VALUES(?,?,?,?,?,?,?)",
-                      [(wid, sid, t, p, cu, l, now) for t, p, cu, l in res])
-
-
-# ───────────────────────── Raccolta vini: unione e verifica nei negozi ─────────────────────────
-GENERIC = {"doc", "docg", "igt", "igp", "aoc", "aop", "rosso", "bianco", "rosato", "brut", "riserva", "reserve",
-           "cuvee", "blanc", "rouge", "vino", "vin", "wein", "cru"}
-
-
-def wine_key(name):
-    return " ".join(sorted(t for t in tokens(name) if not t.isdigit()))
-
-
-def merge_wines(old, new):
-    """Aggiunge ai vini già raccolti quelli nuovi (stessa etichetta = stesso vino), senza mai toglierne."""
-    out, seen = list(old), {wine_key(w.get("name") or "") for w in old}
-    for w in new:
-        k = wine_key(w.get("name") or "")
-        if k and k not in seen:
-            seen.add(k)
-            out.append(w)
-    return out
-
-
-def shop_evidence(producer):
-    """Prodotti del produttore trovati nei negozi con ricerca automatica: [(sito, testo normalizzato)]."""
-    shops = q("SELECT * FROM shops WHERE enabled=1 AND auto=1").to_dict("records")
-    ptok = tokens(producer)
-
-    def one(s):
-        if "products.json" in s["url"]:
-            raw, err = shopify_catalog(s["url"])
+        if merge_into:
+            pid = merge_into
+            cur = c.execute("SELECT country, region, notes FROM producers WHERE id=?", (pid,)).fetchone()
+            c.execute("UPDATE producers SET country=?, region=?, notes=? WHERE id=?",
+                      (cur[0] or country, cur[1] or region, cur[2] or notes, pid))
+            have = {(norm(t), norm(g)) for t, g in c.execute("SELECT type, grape FROM styles WHERE producer_id=?", (pid,))}
+            styles = [(t, g) for t, g in styles if (norm(t), norm(g)) not in have]
+        elif pid is None:
+            pid = c.execute("INSERT INTO producers(name,country,region,notes) VALUES(?,?,?,?)", (name, country, region, notes)).lastrowid
         else:
-            html, err = fetch(build_url(s["url"], producer))
-            raw = [] if err else parse(html, s["url"])
-        return [(s["name"], norm(f"{t} {urlparse(l).path}")) for t, p, c, l in raw if matches(norm(f"{t} {l}"), ptok)]
-
-    if not shops:
-        return []
-    with ThreadPoolExecutor(8) as ex:
-        return [x for part in ex.map(one, shops) for x in part]
-
-
-def sq(s):
-    return " ".join(norm(s).split())
+            c.execute("UPDATE producers SET name=?, country=?, region=?, notes=? WHERE id=?", (name, country, region, notes, pid))
+            c.execute("DELETE FROM styles WHERE producer_id=?", (pid,))
+            c.execute("DELETE FROM avail WHERE producer_id=?", (pid,))
+        c.executemany("INSERT INTO styles(producer_id,type,grape) VALUES(?,?,?)", [(pid, t, g) for t, g in styles])
+        for s in sites:
+            row = c.execute("SELECT id FROM shops WHERE name=?", (s,)).fetchone()
+            if row:
+                c.execute("INSERT OR IGNORE INTO avail(producer_id, shop_id) VALUES(?,?)", (pid, row[0]))
+    return pid
 
 
-def is_confirmed(w):
-    v = str(w.get("verifica", ""))
-    return "✅" in v or "🌐" in v
-
-
-def verify_wines(wines, evidence):
-    """Aggiunge a ogni vino la colonna 'verifica': sito ufficiale (🌐) e negozi in cui compare l'etichetta (✅)."""
-    out = []
-    for w in wines:
-        toks = [t for t in tokens(w.get("name") or "") if not t.isdigit() and t not in GENERIC]
-        sites = sorted({site for site, text in evidence if toks and all(x in text for x in toks)})
-        parts = ([f"🌐 {w['official']}"] if w.get("official") else []) + ([f"✅ {', '.join(sites)}"] if sites else [])
-        out.append({**w, "verifica": " · ".join(parts) or ("— non trovato" if evidence else "n/d")})
-    return out
-
-
-# ── sito ufficiale del produttore: nomi copiati dal testo originale
-NOT_OFFICIAL = ("wine-searcher", "vivino", "wikipedia", "facebook", "instagram", "tannico", "callmewine", "vinum", "falstaff",
-                "google", "youtube", "tripadvisor", "decanter", "jancisrobinson", "twitter", "linkedin", "pinterest")
-WINE_HINTS = ("wein", "wine", "vin", "vini", "produkt", "sortiment", "etichett", "collection", "range", "cave", "shop")
-
-
-def official_domain(producer, sources):
-    """Tra le pagine consultate sul web, cerca un dominio che contiene il nome del produttore (di solito è il suo sito)."""
-    ptok = [t for t in tokens(producer) if len(t) >= 4]
-    for x in sources:
-        dom = (x.get("title") or "").lower().replace("https://", "").replace("http://", "").strip("/ ")
-        dom = dom.removeprefix("www.")
-        compact = norm(dom).replace(" ", "")
-        if "." in dom and " " not in dom and not any(b in dom for b in NOT_OFFICIAL) and any(t in compact for t in ptok):
-            return dom
-    return None
-
-
-def robots_ok(url):
-    try:
-        r = requests.get("/".join(url.split("/")[:3]) + "/robots.txt", headers=UA, timeout=8)
-        if r.status_code != 200:
-            return True
-        rp = RobotFileParser()
-        rp.parse(r.text.splitlines())
-        return rp.can_fetch(UA["User-Agent"], url)
-    except Exception:
-        return True
-
-
-def site_text(domain, max_pages=6, limit=30000):
-    """Testo della home e di alcune pagine sui vini del sito (rispetta robots.txt)."""
-    home = f"https://{domain}/"
-    todo, seen, texts = [home], set(), []
-    while todo and len(seen) < max_pages:
-        url = todo.pop(0)
-        if url in seen or not robots_ok(url):
-            continue
-        seen.add(url)
-        html, err = fetch(url)
-        if err:
-            continue
-        soup = BeautifulSoup(html, "html.parser")
-        for t in soup(["script", "style", "noscript"]):
-            t.decompose()
-        texts.append(soup.get_text(" ", strip=True))
-        if url == home:
-            for a in soup.find_all("a", href=True):
-                u = urljoin(url, a["href"]).split("#")[0]
-                if urlparse(u).netloc.removeprefix("www.") == domain.removeprefix("www.") and u not in seen and u not in todo \
-                        and any(h in (u + " " + a.get_text()).lower() for h in WINE_HINTS):
-                    todo.append(u)
-    return " ".join(texts)[:limit]
-
-
-def official_wines(producer, sources):
-    """Etichette copiate dal sito ufficiale: ogni nome deve comparire alla lettera nel testo della pagina. Ritorna (vini, dominio)."""
-    dom = official_domain(producer, sources)
-    if not dom:
-        return [], None
-    text = site_text(dom)
-    if len(text) < 200:
-        return [], dom
-    res = parse_json(ask_llm(
-        f"""Dal testo qui sotto, preso dal sito ufficiale di "{producer}", estrai i nomi delle etichette di vino prodotte. """
-        """COPIA i nomi LETTERALMENTE come appaiono nel testo, senza tradurli né modificarli. Rispondi SOLO con JSON: """
-        """{"wines":[{"name":"","wine_type":"rosso|bianco|rosato|spumante|dolce|altro","grapes":""}]}. """
-        f"""Non aggiungere vini che non compaiono nel testo.\n\nTESTO:\n{text}"""))
-    tn, out = sq(text), []
-    for w in res.get("wines", []) or []:
-        n = clean_wine_name(w.get("name"))
-        if n and sq(n) in tn:
-            out.append({**w, "name": n, "official": dom})
-    return out, dom
-
-
-def producer_key(name):
-    return " ".join(sorted(tokens(name))) or norm(name)
-
-
-def find_producer(name):
-    """Produttore già in rubrica con lo stesso nome (ignora maiuscole, accenti, ordine e parole come Domaine/Tenuta)."""
-    k = producer_key(name)
-    for r in q("SELECT id, name FROM producers").to_dict("records"):
-        if producer_key(r["name"]) == k:
-            return r
-    return None
-
-
-def _txt(x):
-    return "" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x).strip()
-
-
-def compare_wines(pid, wines):
-    """Confronta i vini proposti con quelli già salvati: (nuovi, già presenti)."""
-    have = {wine_key(n) for n in q("SELECT name FROM wines WHERE producer_id=?", (int(pid),))["name"]}
-    new, known = [], []
-    for n in wines["name"]:
-        n = _txt(n)
-        if wine_key(n):
-            (known if wine_key(n) in have else new).append(n)
-    return new, known
-
-
-def merge_into_producer(pid, country, region, sub, wines):
-    """Unisce i vini a un produttore esistente: quelli già presenti restano, si aggiungono solo i nuovi e si completano i campi vuoti."""
-    added = same = 0
+def delete_producer(pid):
     with db() as c:
-        cur = c.execute("SELECT country, region, subregion FROM producers WHERE id=?", (int(pid),)).fetchone()
-        c.execute("UPDATE producers SET country=?, region=?, subregion=? WHERE id=?",
-                  (*[_txt(old) or _txt(new) for old, new in zip(cur, (country, region, sub))], int(pid)))
-        have = {wine_key(n): (i, t, g) for i, n, t, g in
-                c.execute("SELECT id,name,wine_type,grapes FROM wines WHERE producer_id=?", (int(pid),))}
-        for _, r in wines.iterrows():
-            name, typ, grapes = _txt(r.get("name")), _txt(r.get("wine_type")), _txt(r.get("grapes"))
-            k = wine_key(name)
-            if not k:
-                continue
-            if k in have:
-                same += 1
-                wid, t, g = have[k]
-                if not _txt(t) and typ:
-                    c.execute("UPDATE wines SET wine_type=? WHERE id=?", (typ, wid))
-                if not _txt(g) and grapes:
-                    c.execute("UPDATE wines SET grapes=? WHERE id=?", (grapes, wid))
-            else:
-                wid = c.execute("INSERT INTO wines(producer_id,name,wine_type,grapes) VALUES(?,?,?,?)",
-                                (int(pid), name, typ, grapes)).lastrowid
-                have[k] = (wid, typ, grapes)
-                added += 1
-    return added, same
+        c.execute("DELETE FROM producers WHERE id=?", (int(pid),))
+    autosave()
 
 
-# ───────────────────────── Annata, formato, schede ─────────────────────────
-FORMATS = {"magnum": 1.5, "jeroboam": 3.0, "jéroboam": 3.0, "mathusalem": 6.0, "demi-bouteille": 0.375,
-           "demi bouteille": 0.375, "half bottle": 0.375, "mezza bottiglia": 0.375, "halbe flasche": 0.375}
+def upsert_shop(name, country="", url=""):
+    known = KNOWN_SHOPS.get(norm(name), ("", ""))
+    with db() as c:
+        c.execute("INSERT INTO shops(name,country,url) VALUES(?,?,?) ON CONFLICT(name) DO NOTHING",
+                  (name, country or known[0], url or known[1]))
 
 
-def wine_vintage(title, link=""):
-    for txt in (str(title), str(link)):
-        m = re.search(r"(?<!\d)(19[5-9]\d|20[0-3]\d)(?!\d)", txt)
-        if m:
-            return m.group(1)
-    return "n/d"
+# ───────────────────────── Importazione dal vecchio foglio Excel ─────────────────────────
+def _cl(x):
+    return "" if x is None or (isinstance(x, float) and pd.isna(x)) else " ".join(str(x).split())
 
 
-def wine_format(title):
-    t = str(title).lower()
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s?(cl|ml|l|lt|litri|liter|litre)\b", t)
-    if m:
-        v = float(m.group(1).replace(",", "."))
-        v = v / 100 if m.group(2) == "cl" else v / 1000 if m.group(2) == "ml" else v
-        if 0.1 <= v <= 18:
-            return round(v, 3)
-    for k, v in FORMATS.items():
-        if k in t:
-            return v
-    return 0.75
+def read_old_xlsx(raw):
+    """Legge il foglio con colonne Paese, Regione, Produttore, Tipo n, Uva n, Sito n. Ritorna (righe, siti, correzioni)."""
+    sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None, header=None, dtype=str)
+    found = None
+    for name, df in sheets.items():
+        for i in range(min(10, len(df))):
+            if "produttore" in [norm(x) for x in df.iloc[i].tolist()]:
+                found = (name, df, i)
+                break
+        if found:
+            break
+    if not found:
+        return None, None, ["Non trovo la colonna «Produttore» nel file."]
+    sheet, df, hr = found
+    header = [norm(x) for x in df.iloc[hr]]
+    idx = lambda pat: {int(re.findall(r"\d+", h)[0]) if re.search(r"\d", h) else 0: i for i, h in enumerate(header) if re.fullmatch(pat, h)}
+    col_c, col_r, col_p = idx("paese").get(0), idx("regione").get(0), idx("produttore").get(0)
+    types, grapes, sites_c = idx(r"tipo \d+"), idx(r"uva \d+"), idx(r"sito \d+")
+    fixes, canon_sites, canon_regions = {}, [], []
+    note = lambda k: fixes.__setitem__(k, fixes.get(k, 0) + 1)
+    for name, d in sheets.items():  # liste dei menu a tendina (foglio «Elenchi»)
+        hdr = [norm(x) for x in d.iloc[0]] if len(d) else []
+        if "sito" in hdr and name != sheet:
+            canon_sites = [_cl(x) for x in d.iloc[1:, hdr.index("sito")] if _cl(x)]
+        if "regione" in hdr and name != sheet:
+            canon_regions = [_cl(x) for x in d.iloc[1:, hdr.index("regione")] if _cl(x)]
+    canon_sites = [re.sub(r"\bResturant\b", "Restaurant", s) for s in canon_sites]
+    lm = {c.lower(): c for c in KNOWN_COUNTRIES}
+
+    def clean(raw_val, kind, canon=None, cutoff=0.8):
+        v = _cl(raw_val)
+        if v != ("" if raw_val is None or (isinstance(raw_val, float) and pd.isna(raw_val)) else str(raw_val)):
+            note("spazi superflui rimossi")
+        if kind == "site":
+            v = re.sub(r"\bResturant\b", "Restaurant", v)
+        pool = {c.lower(): c for c in (canon or [])}
+        m = get_close_matches(v.lower(), list(pool), 1, cutoff)
+        if m and pool[m[0]] != v:
+            note(f"«{v}» → «{pool[m[0]]}»")
+            v = pool[m[0]]
+        return v
+
+    rows, by_key, used = [], {}, []
+    for _, r in df.iloc[hr + 1:].iterrows():
+        name = _cl(r.iloc[col_p]) if col_p is not None else ""
+        if not name:
+            continue
+        country = clean(r.iloc[col_c], "c", KNOWN_COUNTRIES, 0.75) if col_c is not None else ""
+        region = clean(r.iloc[col_r], "r", canon_regions, 0.85) if col_r is not None else ""
+        styles = []
+        for n, ti in sorted(types.items()):
+            t, g = _cl(r.iloc[ti]).capitalize(), _cl(r.iloc[grapes[n]]) if n in grapes else ""
+            if t or g:
+                styles.append((t, g))
+        sites = [s for s in (clean(r.iloc[i], "site", canon_sites, 0.85) for _, i in sorted(sites_c.items())) if s]
+        k = pkey(name)
+        if k in by_key:  # stesso produttore inserito due volte: unisco
+            p = by_key[k]
+            p["styles"] += [x for x in styles if x not in p["styles"]]
+            p["sites"] += [x for x in sites if x not in p["sites"]]
+            p["country"], p["region"] = p["country"] or country, p["region"] or region
+            note(f"produttore doppio unito: {p['name']}")
+        else:
+            by_key[k] = {"name": name, "country": country, "region": region, "styles": styles, "sites": sites}
+            rows.append(by_key[k])
+        used += sites
+    shops = list(dict.fromkeys(canon_sites + used))
+    return rows, shops, [f"{k} ({v})" if v > 1 else k for k, v in fixes.items()]
 
 
-def fmt_label(v):
-    names = {0.375: "37,5 cl", 0.75: "75 cl", 1.5: "Magnum 1,5 L", 3.0: "Jéroboam 3 L", 6.0: "Mathusalem 6 L"}
-    return names.get(v, f"{v:g} L".replace(".", ","))
+def import_rows(rows, shops):
+    for s in shops:
+        upsert_shop(s)
+    allp = load_all()
+    added = merged = 0
+    for p in rows:
+        ex = find_producer(p["name"], allp)
+        save_producer(None, p["name"], p["country"], p["region"], "", p["styles"], p["sites"], merge_into=ex["id"] if ex else None)
+        merged, added = merged + bool(ex), added + (not ex)
+        allp = load_all() if not ex else allp
+    return added, merged
 
 
-def eur(p):
-    return "€ " + f"{p:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+def export_df():
+    allp = load_all()
+    ns, nt = max([len(p["sites"]) for p in allp] + [3]), max([len(p["styles"]) for p in allp] + [2])
+    out = []
+    for p in allp:
+        row = {"Paese": p["country"], "Regione": p["region"], "Produttore": p["name"]}
+        for i in range(nt):
+            row[f"Tipo {i + 1}"], row[f"Uva {i + 1}"] = (p["styles"][i] if i < len(p["styles"]) else ("", ""))
+        for i in range(ns):
+            row[f"Sito {i + 1}"] = p["sites"][i] if i < len(p["sites"]) else ""
+        row["Note"] = p["notes"]
+        out.append(row)
+    return pd.DataFrame(out)
 
 
-def offer_card(r):
-    link = str(r["Link"])
-    href = escape(link, quote=True) if link.startswith(("http://", "https://")) else "#"
-    more = (f'<div class="wh-note">{int(r["N"])} offerte: da {eur(r["Prezzo"])} a {eur(r["Max"])}</div>'
-            if r["N"] > 1 else "")
-    return ('<div class="wh-card"><div class="wh-top"><div>'
-            f'<div class="wh-prod">{escape(str(r["Produttore"]))}</div><div class="wh-wine">{escape(str(r["Vino"]))}</div>'
-            f'<div class="wh-tags"><span>{escape(str(r["Annata"]))}</span><span>{escape(fmt_label(r["Formato"]))}</span></div></div>'
-            f'<div class="wh-price">{eur(r["Prezzo"])}</div></div>'
-            f'<div class="wh-foot"><span>{escape(str(r["Sito"]))} · {escape(str(r["Paese"]))}</span>'
-            f'<a href="{href}" target="_blank" rel="noopener noreferrer">Apri ↗</a></div>{more}</div>')
+# ───────────────────────── Schede ─────────────────────────
+def shop_link(shop, text):
+    url = (shop or {}).get("url") or ""
+    if not url:
+        return ""
+    href = url.replace("{q}", quote_plus(text))
+    if not href.startswith(("http://", "https://")):
+        return ""
+    label = "Cerca" if "{q}" in url else "Apri sito"
+    return f'<a href="{escape(href, quote=True)}" target="_blank" rel="noopener noreferrer">{label} ↗</a>'
 
 
-def kpis(items):
-    return '<div class="wh-kpi">' + "".join(f"<div><b>{v}</b><span>{k}</span></div>" for k, v in items) + "</div>"
+def pcard(p, shop):
+    zone = " · ".join(x for x in (p["country"], p["region"]) if x) or "—"
+    chips = "".join(f"<span>{escape(t)}{' · ' + escape(g) if g else ''}</span>" for t, g in p["styles"])
+    others = [s for s in p["sites"] if not shop or s != shop["name"]]
+    also = f'<div class="wh-note">Anche su: {escape(", ".join(others))}</div>' if others else ""
+    return (f'<div class="wh-card"><div class="wh-prod">{escape(zone)}</div><div class="wh-wine">{escape(p["name"])}</div>'
+            f'<div class="wh-tags">{chips}</div><div class="wh-foot"><span></span>{shop_link(shop, p["name"])}</div>{also}</div>')
 
 
 CSS = """<style>
@@ -766,21 +324,18 @@ CSS = """<style>
 h1,h2,h3{font-family:Georgia,'Times New Roman',serif}
 .wh-hero h1{margin:0;padding:0;font-size:2rem;color:var(--wine)}
 .wh-hero p{margin:.1rem 0 .8rem;opacity:.7}
-.wh-kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:.5rem;margin-bottom:.8rem}
+.wh-kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;margin-bottom:.8rem}
 .wh-kpi div{background:var(--soft);border:1px solid var(--line);border-radius:12px;padding:.5rem .7rem;text-align:center}
 .wh-kpi b{display:block;font-size:1.35rem;font-family:Georgia,serif;color:var(--wine)}
 .wh-kpi span{font-size:.72rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em}
-@media (max-width:640px){.wh-kpi{grid-template-columns:repeat(2,1fr)}}
 .wh-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:.7rem}
 .wh-card{background:var(--soft);border:1px solid var(--line);border-left:4px solid var(--wine);border-radius:12px;padding:.8rem .9rem}
-.wh-top{display:flex;justify-content:space-between;gap:.8rem;align-items:flex-start}
 .wh-prod{font-size:.78rem;opacity:.7;text-transform:uppercase;letter-spacing:.05em}
-.wh-wine{font-family:Georgia,serif;font-size:1.05rem;font-weight:600;line-height:1.25;margin:.1rem 0 .35rem}
-.wh-tags span{display:inline-block;font-size:.72rem;border:1px solid var(--line);border-radius:99px;padding:.05rem .5rem;margin-right:.3rem}
-.wh-price{font-family:Georgia,serif;font-size:1.35rem;font-weight:700;color:var(--wine);white-space:nowrap}
-.wh-foot{display:flex;justify-content:space-between;align-items:center;margin-top:.6rem;font-size:.85rem}
+.wh-wine{font-family:Georgia,serif;font-size:1.1rem;font-weight:600;line-height:1.25;margin:.1rem 0 .4rem}
+.wh-tags span{display:inline-block;font-size:.72rem;border:1px solid var(--line);border-radius:99px;padding:.05rem .5rem;margin:0 .3rem .2rem 0}
+.wh-foot{display:flex;justify-content:space-between;align-items:center;margin-top:.4rem;font-size:.85rem}
 .wh-foot a{color:var(--wine);font-weight:600;text-decoration:none}
-.wh-note{margin-top:.35rem;font-size:.75rem;opacity:.65}
+.wh-note{margin-top:.3rem;font-size:.75rem;opacity:.65}
 button[kind="primary"],button[data-testid="stBaseButton-primary"]{background:var(--wine);border-color:var(--wine);color:#fff}
 button[kind="primary"]:hover,button[data-testid="stBaseButton-primary"]:hover{background:var(--wine-d);border-color:var(--wine-d);color:#fff}
 .stTabs [aria-selected="true"]{color:var(--wine)}
@@ -788,402 +343,196 @@ button[kind="primary"]:hover,button[data-testid="stBaseButton-primary"]:hover{ba
 </style>"""
 
 
-def producers_summary():
-    """Un record per produttore, con numero di vini e testo di ricerca."""
-    return q("""SELECT p.id, p.name, p.country, p.region, p.subregion, COUNT(w.id) AS n,
-                COALESCE(GROUP_CONCAT(w.name || ' ' || COALESCE(w.grapes, '') || ' ' || COALESCE(w.wine_type, ''), ' '), '') AS hay
-                FROM producers p LEFT JOIN wines w ON w.producer_id = p.id
-                GROUP BY p.id ORDER BY p.name COLLATE NOCASE""")
+def pick(box, label, options, current, key):
+    """Menu a tendina con i valori già usati (evita errori di battitura) e la voce «➕ Altro…» per i valori nuovi."""
+    opts = sorted({o for o in options if o} | ({current} if current else set()), key=str.lower)
+    choice = box.selectbox(label, opts + ["➕ Altro…"], index=opts.index(current) if current in opts else None,
+                           placeholder="Scegli…", key=key)
+    return box.text_input(f"{label}: nuovo valore", key=key + "n").strip() if choice == "➕ Altro…" else (choice or "")
 
 
-def zone_of(r):
-    return " · ".join(str(x) for x in (r["country"], r["region"], r["subregion"]) if x)
-
-
-def filter_producers(prod, txt):
-    words = norm(txt).split()
-    if not words:
-        return prod.reset_index(drop=True)
-    hay = (prod["name"].fillna("") + " " + prod["country"].fillna("") + " " + prod["region"].fillna("") + " "
-           + prod["subregion"].fillna("") + " " + prod["hay"]).map(norm)
-    return prod[hay.map(lambda h: all(w in h for w in words))].reset_index(drop=True)
-
-
-def delete_producer(pid):
-    with db() as c:
-        c.execute("DELETE FROM producers WHERE id=?", (int(pid),))  # elimina anche vini e offerte collegati
-    autosave()
-
-
-# ───────────────────────── UI ─────────────────────────
-def producer_form(pid, d, wines, key):
-    name = st.text_input("Produttore", d["name"], key=f"n{key}")
-    c1, c2, c3 = st.columns(3)
-    country = c1.text_input("Paese", d["country"], key=f"c{key}")
-    region = c2.text_input("Regione", d["region"], key=f"r{key}")
-    sub = c3.text_input("Sotto-regione", d["subregion"], key=f"s{key}")
-    wines = st.data_editor(
-        wines, num_rows="dynamic", hide_index=True, use_container_width=True, key=f"w{key}",
-        column_config={"id": None, "name": "Vino",
-                       "wine_type": st.column_config.SelectboxColumn("Tipo", options=TYPES),
-                       "grapes": "Uve", "verifica": st.column_config.TextColumn("Verifica", disabled=True)})
-    ex = find_producer(name) if pid is None and name.strip() else None
+def producer_form(pid, allp, shops):
+    cur = next((p for p in allp if p["id"] == pid), None) if pid else None
+    k = f"pf{pid or 'new'}_{st.session_state.fv}"
+    name = st.text_input("Produttore", cur["name"] if cur else "", key=k + "n")
+    c1, c2 = st.columns(2)
+    country = pick(c1, "Paese", [p["country"] for p in allp] + KNOWN_COUNTRIES, cur["country"] if cur else "", k + "c")
+    region = pick(c2, "Regione", [p["region"] for p in allp], cur["region"] if cur else "", k + "r")
+    types = sorted({t for p in allp for t, _ in p["styles"] if t} | set(BASE_TYPES))
+    sdf = st.data_editor(pd.DataFrame(cur["styles"] if cur else [], columns=["Tipo", "Uva"]), num_rows="dynamic", hide_index=True,
+                         use_container_width=True, key=k + "s",
+                         column_config={"Tipo": st.column_config.SelectboxColumn("Tipo", options=types), "Uva": "Uva"})
+    sites = st.multiselect("🛒 Siti dove hai verificato che li trovi", [s["name"] for s in shops], default=cur["sites"] if cur else [], key=k + "w")
+    notes = st.text_area("Note", cur["notes"] if cur else "", key=k + "t", height=80)
+    ex = find_producer(name, allp) if not pid and name.strip() else None
     if ex:
-        new, known = compare_wines(ex["id"], wines)
-        st.info(f"📎 «{ex['name']}» è già in rubrica. Salvando verranno **aggiunti solo i vini nuovi** ({len(new)}): "
-                f"{', '.join(new) or 'nessuno'}. I {len(known)} vini già presenti restano invariati.")
-    if st.button(f"🔀 Unisci a «{ex['name']}»" if ex else "💾 Salva", key=f"save{key}", type="primary"):
+        st.info(f"📎 «{ex['name']}» è già in rubrica: salvando verranno aggiunti solo tipi/uve e siti nuovi, senza togliere nulla.")
+    if st.button(f"🔀 Unisci a «{ex['name']}»" if ex else "💾 Salva", key=k + "b", type="primary"):
         if not name.strip():
             st.error("Inserisci il nome del produttore.")
         else:
             try:
-                msg = "Salvato ✅"
-                if ex:
-                    added, same = merge_into_producer(ex["id"], country, region, sub, wines)
-                    msg = f"Unito a «{ex['name']}»: {added} vini nuovi aggiunti, {same} già presenti 🔀"
-                else:
-                    save_producer(pid, name.strip(), country, region, sub, wines)
+                styles = [(_cl(t), _cl(g)) for t, g in sdf[["Tipo", "Uva"]].itertuples(index=False)]
+                save_producer(pid, name.strip(), country, region, notes.strip(), styles, sites, merge_into=ex["id"] if ex else None)
                 autosave()
-                st.session_state.draft = None
-                st.session_state.editing = None
-                st.session_state.tbl_v = st.session_state.get("tbl_v", 0) + 1
-                st.toast(msg)
+                st.session_state.fv += 1
+                st.session_state.tv += 1
+                st.toast("Salvato ✅")
                 st.rerun()
             except sqlite3.IntegrityError:
-                st.error("Produttore già presente.")
+                st.error("Esiste già un produttore con questo nome.")
 
 
-def apply_result(name, res):
-    """Aggiunge il risultato all'elenco già raccolto (senza cancellare nulla). Se trova il sito ufficiale usa i nomi letti lì;
-    i vini proposti dal modello restano solo se confermati da un negozio."""
-    acc = st.session_state.setdefault("af", {}).setdefault(
-        norm(name), {"name": "", "country": "", "region": "", "subregion": "", "wines": []})
-    nd = new_draft(name, res)
-    for k in ("name", "country", "region", "subregion"):
-        acc[k] = acc[k] or nd[k]
-    known = {x["uri"] for x in acc.setdefault("sources", [])}
-    acc["sources"] += [x for x in (res or {}).get("_sources", []) if x["uri"] not in known]
-    producer = acc["name"] or name
-    new_w, dom = nd["wines"], None
-    if (res or {}).get("_sources"):
-        with st.spinner("Leggo il sito ufficiale del produttore…"):
-            try:
-                official, dom = official_wines(producer, res["_sources"])
-            except Exception:
-                official, dom = [], None
-        acc["official"] = dom or acc.get("official")
-        if official:
-            with st.spinner("Verifica nei negozi collegati…"):
-                evidence = shop_evidence(producer)
-            site_keys = {wine_key(w["name"]) for w in official}
-            ai = verify_wines([w for w in new_w if wine_key(w["name"]) not in site_keys], evidence)
-            keep = [w for w in ai if w["verifica"].startswith("✅")]
-            acc.setdefault("discarded", [])
-            acc["discarded"] += [w["name"] for w in ai if w not in keep and w["name"] not in acc["discarded"]]
-            new_w = official + [{k: v for k, v in w.items() if k != "verifica"} for w in keep]
-    acc["wines"] = merge_wines(acc["wines"], new_w)
-    with st.spinner("Verifica nei negozi collegati…"):
-        acc["wines"] = verify_wines(acc["wines"], shop_evidence(producer))
-    st.session_state.draft = acc
-    st.session_state.dv += 1
-
-
-st.set_page_config(page_title="Wine Hunter", page_icon="🍷", layout="wide")
+# ───────────────────────── Interfaccia ─────────────────────────
+st.set_page_config(page_title="Cantina", page_icon="🍷", layout="wide")
 init()
 first_boot()
+for _k, _v in (("fv", 0), ("tv", 0), ("confirm", None)):
+    st.session_state.setdefault(_k, _v)
 st.markdown(CSS, unsafe_allow_html=True)
 _n = lambda sql: int(q(sql).iloc[0, 0])
-st.markdown('<div class="wh-hero"><h1>🍷 Wine Hunter</h1><p>Rubrica dei produttori e caccia al miglior prezzo</p></div>'
-            + kpis([("Produttori", _n("SELECT COUNT(*) FROM producers")), ("Vini", _n("SELECT COUNT(*) FROM wines")),
-                    ("Offerte", _n("SELECT COUNT(*) FROM offers")), ("Siti attivi", _n("SELECT COUNT(*) FROM shops WHERE enabled=1"))]),
-            unsafe_allow_html=True)
-t1, t2, t3, t4, t5 = st.tabs(["📒 Rubrica", "➕ Nuovo", "🛒 Offerte", "🌐 Siti", "💾 Dati"])
+st.markdown('<div class="wh-hero"><h1>🍷 Cantina</h1><p>Produttori e siti dove sei certo di trovare i loro vini</p></div>'
+            '<div class="wh-kpi">' + "".join(f"<div><b>{v}</b><span>{k}</span></div>" for k, v in (
+                ("Produttori", _n("SELECT COUNT(*) FROM producers")), ("Siti", _n("SELECT COUNT(*) FROM shops")),
+                ("Collegamenti", _n("SELECT COUNT(*) FROM avail")))) + "</div>", unsafe_allow_html=True)
+t1, t2, t3, t4 = st.tabs(["🛒 Per sito", "📒 Produttori", "🌐 Siti", "💾 Dati"])
+allp = load_all()
+shops_df = q("SELECT id,name,country,url FROM shops ORDER BY name COLLATE NOCASE")
+shops = shops_df.to_dict("records")
 
-# ── Rubrica
+# ── Per sito
 with t1:
-    for k, v in (("tbl_v", 0), ("editing", None), ("confirm_del", None)):
-        st.session_state.setdefault(k, v)
-    prod = producers_summary()
-    if prod.empty:
-        st.info("Rubrica vuota: aggiungi un produttore dalla scheda ➕ Nuovo.")
+    if not allp:
+        st.info("Nessun produttore: importa il tuo foglio dalla scheda 💾 Dati o aggiungili dalla scheda 📒 Produttori.")
     else:
-        txt = st.text_input("🔎 Cerca produttore, vino, uva o regione")
-        view = filter_producers(prod, txt)
-        st.caption(f"{len(view)} produttori · tocca una riga per vedere i vini")
-        if view.empty:
-            st.info("Nessun risultato.")
-            row = None
-        else:
-            table = pd.DataFrame({"Produttore": view["name"], "Zona": view.apply(zone_of, axis=1), "Vini": view["n"]})
-            ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun",
-                              selection_mode="single-row", key=f"ptbl_{st.session_state.tbl_v}_{txt.strip()}",
-                              column_config={"Vini": st.column_config.NumberColumn("Vini", width="small")})
-            pick = st.selectbox("…oppure scegli dall'elenco", list(view["name"]), index=None,
-                                placeholder="Scegli un produttore", key=f"psel_{st.session_state.tbl_v}")
-            sel = ev.selection.rows
-            row = view.iloc[sel[0]] if sel else (view[view["name"] == pick].iloc[0] if pick else None)
-        if row is not None:
-            pid = int(row["id"])
-            wdf = q("SELECT id,name,wine_type,grapes FROM wines WHERE producer_id=? ORDER BY name", (pid,))
-            st.divider()
-            st.markdown(f"### {row['name']}")
-            st.caption(zone_of(row) or "Zona non indicata")
-            if wdf.empty:
-                st.info("Nessun vino registrato per questo produttore.")
-            else:
-                st.dataframe(wdf.rename(columns={"name": "Vino", "wine_type": "Tipo", "grapes": "Uve"})[["Vino", "Tipo", "Uve"]],
-                             hide_index=True, use_container_width=True)
-            c1, c2 = st.columns(2)
-            if c1.button("✏️ Modifica", key=f"ed{pid}", use_container_width=True):
-                st.session_state.editing, st.session_state.confirm_del = pid, None
-            if c2.button("🗑️ Elimina", key=f"rm{pid}", use_container_width=True):
-                st.session_state.confirm_del, st.session_state.editing = pid, None
-            if st.session_state.confirm_del == pid:
-                st.warning(f"Eliminare «{row['name']}», i suoi {len(wdf)} vini e le offerte collegate? L'operazione non si può annullare.")
-                y, n = st.columns(2)
-                if y.button("Sì, elimina", key=f"yes{pid}", type="primary", use_container_width=True):
-                    delete_producer(pid)
-                    st.session_state.confirm_del = None
-                    st.session_state.tbl_v += 1
-                    st.toast("Produttore eliminato 🗑️")
-                    st.rerun()
-                if n.button("Annulla", key=f"no{pid}", use_container_width=True):
-                    st.session_state.confirm_del = None
-                    st.rerun()
-            if st.session_state.editing == pid:
-                producer_form(pid, {k: row[k] or "" for k in ["name", "country", "region", "subregion"]}, wdf, f"e{pid}")
-                if st.button("✖ Chiudi modifica", key=f"cl{pid}"):
-                    st.session_state.editing = None
-                    st.rerun()
+        NONE = "— senza sito assegnato —"
+        counts = {s["name"]: sum(s["name"] in p["sites"] for p in allp) for s in shops}
+        options = sorted(counts, key=lambda n: (-counts[n], n.lower())) + [NONE]
+        counts[NONE] = sum(not p["sites"] for p in allp)
+        sel = st.selectbox("🛒 Dove vuoi comprare?", options, format_func=lambda n: f"{n} ({counts[n]})")
+        shop = next((s for s in shops if s["name"] == sel), None)
+        items = [p for p in allp if (not p["sites"] if sel == NONE else sel in p["sites"])]
+        with st.expander("🎛️ Filtri"):
+            txt = st.text_input("Cerca produttore")
+            f_c = st.multiselect("Paese", sorted({p["country"] for p in items if p["country"]}))
+            f_r = st.multiselect("Regione", sorted({p["region"] for p in items if p["region"]}))
+            f_t = st.multiselect("Tipo", sorted({t for p in items for t, _ in p["styles"] if t}))
+            f_u = st.multiselect("Uva", sorted({g for p in items for _, g in p["styles"] if g}))
+        items = [p for p in items if (not txt or norm(txt) in norm(p["name"])) and (not f_c or p["country"] in f_c)
+                 and (not f_r or p["region"] in f_r) and (not f_t or any(t in f_t for t, _ in p["styles"]))
+                 and (not f_u or any(g in f_u for _, g in p["styles"]))]
+        st.caption(f"{len(items)} produttori")
+        if items:
+            st.markdown('<div class="wh-grid">' + "".join(pcard(p, shop) for p in items) + "</div>", unsafe_allow_html=True)
 
-# ── Nuovo produttore
+# ── Produttori
 with t2:
-    st.session_state.setdefault("dv", 0)
-    name = st.text_input("Nome del produttore", key="newname")
-    use_web = st.toggle("🌐 Cerca anche sul web (più lento, con fonti)", value=True, key="use_web")
-    acc0 = st.session_state.get("af", {}).get(norm(name))
-    label = "🔄 Cerca altri vini (aggiunge, non cancella)" if acc0 and acc0["wines"] else "✨ Compila automaticamente"
-    if st.button(label, disabled=not name.strip()):
-        if not (secret("ANTHROPIC_API_KEY") or secret("GEMINI_API_KEY")):
-            st.session_state.draft = new_draft(name, None)
-            st.session_state.dv += 1
-            st.warning("Nessuna chiave API nei Secrets: compila a mano oppure usa «Incolla i dati da una chat» qui sotto.")
-        else:
-            res = None
-            with st.spinner("Ricerca informazioni… (con la ricerca web può richiedere fino a un minuto)"):
-                try:
-                    res = autofill(name, web=use_web)
-                except Exception as e:
-                    st.error(f"Errore: {e}")
-            if res is not None:
-                if res.get("error"):
-                    st.warning("Produttore non riconosciuto: compila a mano.")
-                apply_result(name, res)
-    with st.expander("📋 Senza chiave API: incolla i dati da una chat"):
-        if name.strip():
-            st.caption("1) Tocca l'icona di copia sul testo qui sotto e incollalo in una chat con Claude (o un altro assistente). "
-                       "2) Copia la risposta e incollala nel riquadro.")
-            st.code(autofill_prompt(name.strip()), language=None)
-        else:
-            st.caption("Scrivi prima il nome del produttore.")
-        pasted = st.text_area("Risposta dell'assistente", key="pasted", height=150)
-        if st.button("Usa questi dati", disabled=not (pasted.strip() and name.strip())):
-            try:
-                apply_result(name, parse_json(pasted))
-                st.rerun()
-            except (AttributeError, ValueError):
-                st.error("Non riesco a leggere la risposta: incolla tutto il testo JSON, dalla prima all'ultima parentesi graffa.")
-    d = st.session_state.get("draft")
-    if d:
-        st.caption("⚠️ Dati generati da un modello AI: controlla la colonna «Verifica» prima di salvare.")
-        srcs = d.get("sources", [])
-        if srcs:
-            with st.expander(f"🔗 Fonti consultate sul web ({len(srcs)})"):
-                st.markdown("\n".join("- [" + (x["title"] or x["uri"]).replace("[", "(").replace("]", ")") + "](" + x["uri"] + ")"
-                                      for x in srcs[:15]))
-        else:
-            st.caption("ℹ️ Nessuna fonte web per questo elenco: viene dalla memoria del modello.")
-        b1, b2 = st.columns(2)
-        if b1.button("🧽 Ricomincia da capo", help="Cancella l'elenco raccolto finora per questo produttore", use_container_width=True):
-            st.session_state.get("af", {}).pop(norm(name), None)
-            st.session_state.draft = None
-            st.rerun()
-        if any(is_confirmed(w) for w in d["wines"]):
-            if b2.button("🧹 Tieni solo i confermati", help="Elimina i vini non trovati in nessun negozio", use_container_width=True):
-                d["wines"] = [w for w in d["wines"] if is_confirmed(w)]
-                st.session_state.dv += 1
-                st.rerun()
-        _q, _p = quote_plus(d["name"]), "+".join(norm(d["name"]).split())
-        st.markdown("🔎 **Controlla a mano:** "
-                    f"[Wine-Searcher](https://www.wine-searcher.com/find/{_p}) · [Vivino](https://www.vivino.com/search/wines?q={_q}) · "
-                    f"[Google](https://www.google.com/search?q={_q}+vini) · [Wikipedia](https://it.wikipedia.org/w/index.php?search={_q})")
-        if d["wines"]:
-            ok = sum(is_confirmed(w) for w in d["wines"])
-            st.caption(f"✅ {ok} vini su {len(d['wines'])} confermati dal sito ufficiale (🌐) o da un negozio (✅). "
-                       "«— non trovato» non vuol dire che sia sbagliato: il vino potrebbe non essere in vendita nei siti collegati.")
-        if d.get("official"):
-            st.caption(f"🌐 Nomi letti dal sito ufficiale: {d['official']}")
-        if d.get("discarded"):
-            with st.expander(f"🗑️ Scartati dal modello ({len(d['discarded'])}): non sul sito ufficiale né nei negozi"):
-                st.write(", ".join(d["discarded"]))
-        wdf = pd.DataFrame(d["wines"], columns=["name", "wine_type", "grapes", "verifica"])
-        wdf["verifica"] = wdf["verifica"].fillna("")
-        wdf["wine_type"] = wdf["wine_type"].where(wdf["wine_type"].isin(TYPES), "altro")
-        wdf.insert(0, "id", pd.Series([None] * len(wdf), dtype="float"))
-        producer_form(None, d, wdf, f"new{st.session_state.dv}")
-
-# ── Offerte
-with t3:
-    wines = q("SELECT w.id wine_id, w.name wine, p.name producer FROM wines w JOIN producers p ON p.id=w.producer_id")
-    shops = q("SELECT * FROM shops WHERE enabled=1")
-    if wines.empty:
-        st.info("Aggiungi prima produttori e vini.")
+    mode = st.radio("Modalità", ["📋 Elenco", "➕ Nuovo"], horizontal=True, label_visibility="collapsed")
+    if mode.startswith("➕"):
+        producer_form(None, allp, shops)
+    elif not allp:
+        st.info("Rubrica vuota.")
     else:
-        with st.expander("🔎 Avvia ricerca", expanded=True):
-            sp = st.multiselect("Produttori (vuoto = tutti)", sorted(wines["producer"].unique()))
-            sc = st.multiselect("Paesi dei siti", COUNTRIES, default=COUNTRIES)
-            wl = wines[wines["producer"].isin(sp)] if sp else wines
-            sl = shops[shops["country"].isin(sc) & (shops["auto"] == 1)]
-            jobs = [(w, s) for w in wl.to_dict("records") for s in sl.to_dict("records")]
-            st.caption(f"{len(jobs)} ricerche ({len(wl)} vini × {len(sl)} siti)")
-            if st.button("Cerca offerte", type="primary", disabled=not jobs):
-                bar, errs, stats = st.progress(0.0), [], {}
-                with ThreadPoolExecutor(8) as ex:
-                    for i, (wid, sid, res, err, raw) in enumerate(ex.map(lambda j: search_one(*j), jobs), 1):
-                        save_offers(wid, sid, res)
-                        a, b = stats.get(sid, (0, 0))
-                        stats[sid] = (a + raw, b + len(res))
-                        if err:
-                            errs.append(err)
-                        bar.progress(i / len(jobs))
-                autosave()
-                st.success("Ricerca completata.")
-                names = dict(zip(shops["id"], shops["name"]))
-                st.caption("Riepilogo per sito: se i prodotti sulla pagina sono molti ma i pertinenti zero, il sito ignora la ricerca (URL sbagliato o risultati caricati via JavaScript).")
-                st.dataframe(pd.DataFrame([{"Sito": names.get(k), "Prodotti sulla pagina": a, "Pertinenti": b}
-                                           for k, (a, b) in stats.items()]), hide_index=True)
-                if errs:
-                    with st.expander(f"{len(errs)} errori"):
-                        st.write("\n\n".join(sorted(set(errs))[:30]))
-        with st.expander("🔗 Link di ricerca manuali (per i siti che bloccano l'app)"):
-            ms = st.multiselect("Sito", sorted(shops["name"]), key="ms")
-            mp = st.multiselect("Produttore", sorted(wines["producer"].unique()), key="mp")
-            rows = [
-                {"Sito": s["name"], "Paese": s["country"], "Produttore": w["producer"], "Vino": w["wine"],
-                 "Cerca": build_url(s["url"], f'{w["producer"]} {w["wine"]}', fragment=True)}
-                for s in shops.to_dict("records") if not ms or s["name"] in ms
-                for w in wines.to_dict("records") if not mp or w["producer"] in mp
-            ]
-            st.caption(f"{len(rows)} link")
-            if rows:
-                st.dataframe(pd.DataFrame(rows).sort_values(["Sito", "Produttore", "Vino"]),
-                             use_container_width=True, hide_index=True,
-                             column_config={"Cerca": st.column_config.LinkColumn("Link", display_text="Apri")})
-        off = q("""SELECT p.name Produttore, w.name Vino, w.wine_type Tipo, s.name Sito, s.country Paese,
-                   o.title Titolo, o.price Prezzo, o.link Link, o.found Aggiornato
-                   FROM offers o JOIN wines w ON w.id=o.wine_id JOIN producers p ON p.id=w.producer_id
-                   JOIN shops s ON s.id=o.shop_id""")
-        if off.empty:
-            st.info("Nessuna offerta salvata: avvia una ricerca.")
-        else:
-            off["Annata"] = [wine_vintage(t, l) for t, l in zip(off["Titolo"], off["Link"])]
-            off["Formato"] = off["Titolo"].map(wine_format)
-            with st.expander("🎛️ Filtri"):
-                fp = st.multiselect("Paese del sito", COUNTRIES)
-                fs = st.multiselect("Sito", sorted(off["Sito"].unique()))
-                fprod = st.multiselect("Produttore", sorted(off["Produttore"].unique()))
-                fa = st.multiselect("Annata", sorted(off["Annata"].unique(), reverse=True))
-                ff = st.multiselect("Formato", sorted(off["Formato"].unique()), format_func=fmt_label)
-                lo, hi = float(off["Prezzo"].min()), float(off["Prezzo"].max())
-                pr = st.slider("Prezzo (€)", lo, hi, (lo, hi)) if lo < hi else (lo, hi)
-            for col, sel in (("Paese", fp), ("Sito", fs), ("Produttore", fprod), ("Annata", fa), ("Formato", ff)):
-                if sel:
-                    off = off[off[col].isin(sel)]
-            off = off[off["Prezzo"].between(*pr)].sort_values("Prezzo")
-            view = st.radio("Vista", ["🏆 Migliori prezzi", "📋 Tutte le offerte"], horizontal=True, label_visibility="collapsed")
-            if view.startswith("🏆"):
-                best = (off.groupby(["Produttore", "Vino", "Annata", "Formato"], as_index=False, sort=False)
-                        .agg(Prezzo=("Prezzo", "min"), Max=("Prezzo", "max"), N=("Prezzo", "size"),
-                             Sito=("Sito", "first"), Paese=("Paese", "first"), Link=("Link", "first")))
-                best["_a"] = best["Annata"].where(best["Annata"] != "n/d", "0000")
-                best = best.sort_values(["Produttore", "Vino", "_a", "Formato"], ascending=[True, True, False, True])
-                st.caption(f"{len(best)} combinazioni vino · annata · formato, con il miglior prezzo trovato")
-                more = len(best) > 30 and st.toggle(f"Mostra tutte le {len(best)}", False)
-                shown = best if more else best.head(30)
-                st.markdown('<div class="wh-grid">' + "".join(offer_card(r) for r in shown.to_dict("records")) + "</div>",
-                            unsafe_allow_html=True)
-            else:
-                st.caption(f"{len(off)} offerte")
-                st.dataframe(off.assign(Formato=off["Formato"].map(fmt_label))[
-                    ["Produttore", "Vino", "Annata", "Formato", "Prezzo", "Sito", "Paese", "Titolo", "Link", "Aggiornato"]],
-                    use_container_width=True, hide_index=True, column_config={
-                        "Link": st.column_config.LinkColumn("Link", display_text="Apri"),
-                        "Prezzo": st.column_config.NumberColumn("Prezzo", format="€ %.2f")})
+        txt = st.text_input("🔎 Cerca per produttore, regione, uva o sito", key="ps")
+        words = norm(txt).split()
+        view = [p for p in allp if all(w in norm(" ".join([p["name"], p["country"], p["region"], *p["sites"], *(f"{t} {g}" for t, g in p["styles"])])) for w in words)]
+        st.caption(f"{len(view)} produttori · tocca una riga per aprire la scheda")
+        if view:
+            table = pd.DataFrame({"Produttore": [p["name"] for p in view],
+                                  "Zona": [" · ".join(x for x in (p["country"], p["region"]) if x) for p in view],
+                                  "Tipi e uve": [", ".join(f"{t} {g}".strip() for t, g in p["styles"]) for p in view],
+                                  "Siti": [", ".join(p["sites"]) for p in view]})
+            ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row",
+                              key=f"ptbl_{st.session_state.tv}_{txt.strip()}")
+            pick_name = st.selectbox("…oppure scegli dall'elenco", [p["name"] for p in view], index=None, placeholder="Scegli un produttore",
+                                     key=f"psel_{st.session_state.tv}")
+            sel_rows = ev.selection.rows
+            cur = view[sel_rows[0]] if sel_rows else next((p for p in view if p["name"] == pick_name), None)
+            if cur:
+                st.divider()
+                st.markdown(f"### {cur['name']}")
+                producer_form(cur["id"], allp, shops)
+                if st.button("🗑️ Elimina produttore", key=f"rm{cur['id']}"):
+                    st.session_state.confirm = cur["id"]
+                if st.session_state.confirm == cur["id"]:
+                    st.warning(f"Eliminare «{cur['name']}»? L'operazione non si può annullare.")
+                    y, n = st.columns(2)
+                    if y.button("Sì, elimina", key=f"yes{cur['id']}", type="primary", use_container_width=True):
+                        delete_producer(cur["id"])
+                        st.session_state.confirm, st.session_state.tv = None, st.session_state.tv + 1
+                        st.toast("Produttore eliminato 🗑️")
+                        st.rerun()
+                    if n.button("Annulla", key=f"no{cur['id']}", use_container_width=True):
+                        st.session_state.confirm = None
+                        st.rerun()
 
 # ── Siti
-with t4:
-    st.caption("Usa {q} nell'URL al posto del testo cercato. Aggiungi righe per nuovi siti.")
-    sh = q("SELECT id,name,country,url,enabled,auto FROM shops ORDER BY country,name")
-    sh["enabled"] = sh["enabled"].astype(bool)
-    sh["auto"] = sh["auto"].fillna(1).astype(bool)
-    ed = st.data_editor(sh, num_rows="dynamic", hide_index=True, use_container_width=True, key="shops",
-                        column_config={"id": None, "name": "Nome", "url": "URL di ricerca", "enabled": "Attivo", "auto": "Ricerca automatica",
-                                       "country": st.column_config.SelectboxColumn("Paese", options=COUNTRIES)})
-    if st.button("💾 Salva siti"):
-        ed["enabled"] = ed["enabled"].fillna(True).astype(int)
-        ed["auto"] = ed["auto"].fillna(True).astype(int)
+with t3:
+    st.caption("Per ogni sito: nome, paese e indirizzo di ricerca, con {q} al posto del testo cercato (es. https://sito.it/cerca?q={q}). "
+               "Serve per il pulsante «Cerca» sulle schede. Eliminare un sito toglie anche i suoi collegamenti ai produttori.")
+    ed = st.data_editor(shops_df.assign(country=shops_df["country"].fillna(""), url=shops_df["url"].fillna("")), num_rows="dynamic", hide_index=True,
+                        use_container_width=True, key="shops_ed",
+                        column_config={"id": None, "name": "Sito", "country": st.column_config.SelectboxColumn("Paese", options=KNOWN_COUNTRIES),
+                                       "url": "Indirizzo di ricerca"})
+    if st.button("💾 Salva siti", type="primary"):
+        keep = [int(i) for i in ed["id"].dropna()] or [-1]
         with db() as c:
-            sync_rows(c, "shops", None, None, ed, ["name", "country", "url", "enabled", "auto"])
+            c.execute(f"DELETE FROM shops WHERE id NOT IN ({','.join('?' * len(keep))})", keep)
+            for _, r in ed.iterrows():
+                nm = _cl(r["name"])
+                if not nm:
+                    continue
+                vals = (nm, _cl(r["country"]), _cl(r["url"]))
+                if pd.notna(r["id"]):
+                    c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (*vals, int(r["id"])))
+                else:
+                    c.execute("INSERT OR IGNORE INTO shops(name,country,url) VALUES(?,?,?)", vals)
         autosave()
         st.toast("Siti salvati ✅")
         st.rerun()
-    st.subheader("🧪 Prova un sito")
-    if not sh.empty:
-        tsite = st.selectbox("Sito", sh["name"])
-        tq = st.text_input("Ricerca di prova", "Sassicaia")
-        if st.button("Prova"):
-            row = sh[sh["name"] == tsite].iloc[0]
-            turl = row["url"]
-            if not row["auto"]:
-                st.info("Per questo sito la ricerca automatica è disattivata (il sito non la consente): "
-                        "usa i link manuali nella scheda Offerte.")
-            else:
-                if "products.json" in turl:
-                    items, err = shopify_catalog(turl)
-                else:
-                    url = build_url(turl, tq)
-                    html, err = fetch(url)
-                    items = [] if err else parse(html, url)
-                if err:
-                    st.error(err)
-                else:
-                    qt = tokens(tq)
-                    rel = [i for i in items if all(x in norm(f"{i[0]} {i[3]}") for x in qt)]
-                    st.write(f"{len(items)} prodotti sulla pagina, {len(rel)} pertinenti a «{tq}»")
-                    if items and not rel:
-                        st.warning("Il sito sta ignorando la ricerca: mostra prodotti generici. Controlla l'URL (il parametro di ricerca) oppure usa i link manuali.")
-                    elif not items:
-                        st.info("Nessun prodotto: il sito potrebbe caricare i risultati via JavaScript o bloccare i bot.")
-                    if rel:
-                        st.dataframe(pd.DataFrame(rel, columns=["Titolo", "Prezzo", "Valuta", "Link"]), hide_index=True)
 
 # ── Dati
-with t5:
+with t4:
     if gh_conf():
         st.success("☁️ Salvataggio automatico su GitHub attivo: i dati sopravvivono ai riavvii dell'app.")
-        if st.button("Salva ora su GitHub"):
-            if push_backup():
-                st.success("Salvato.")
-            else:
-                st.error("Salvataggio non riuscito: controlla GITHUB_TOKEN e GITHUB_REPO nei Secrets.")
     else:
-        st.warning("Salvataggio automatico non configurato: i dati si azzerano a ogni riavvio dell'app. "
-                   "Aggiungi GITHUB_TOKEN e GITHUB_REPO nei Secrets, oppure scarica un backup a mano.")
-    st.download_button("⬇️ Scarica backup", json.dumps(dump(), ensure_ascii=False, default=str),
-                       "wine_backup.json", "application/json")
-    up = st.file_uploader("Ripristina da backup", type="json")
-    if up and st.button("♻️ Ripristina (sovrascrive tutto)"):
-        restore(json.load(up))
+        st.warning("Salvataggio automatico non configurato: i dati si azzerano a ogni riavvio. Aggiungi GITHUB_TOKEN e GITHUB_REPO nei Secrets.")
+    st.subheader("📥 Importa il tuo foglio Excel")
+    st.caption("Carica il file con le colonne Paese, Regione, Produttore, Tipo 1/Uva 1…, Sito 1…. I produttori già presenti vengono uniti senza togliere nulla.")
+    up = st.file_uploader("File .xlsx", type=["xlsx"], key="xl")
+    if up:
+        try:
+            rows, new_shops, fixes = read_old_xlsx(up.getvalue())
+        except Exception as e:
+            rows, new_shops, fixes = None, None, [f"Non riesco a leggere il file: {e}"]
+        if rows is None:
+            st.error(fixes[0])
+        else:
+            known = {pkey(p["name"]) for p in allp}
+            st.caption(f"{len(rows)} produttori ({sum(pkey(r['name']) not in known for r in rows)} nuovi) · {len(new_shops)} siti")
+            if fixes:
+                st.info("Correzioni automatiche: " + "; ".join(fixes))
+            st.dataframe(pd.DataFrame([{"Produttore": r["name"], "Paese": r["country"], "Regione": r["region"],
+                                        "Tipi e uve": ", ".join(f"{t} {g}".strip() for t, g in r["styles"]), "Siti": ", ".join(r["sites"]),
+                                        "Stato": "già presente (unito)" if pkey(r["name"]) in known else "nuovo"} for r in rows]),
+                         hide_index=True, use_container_width=True)
+            if st.button("📥 Importa", type="primary"):
+                a, m = import_rows(rows, new_shops)
+                autosave()
+                st.session_state.tv += 1
+                st.toast(f"Importati: {a} produttori nuovi, {m} uniti ✅")
+                st.rerun()
+    st.divider()
+    st.subheader("📤 Esporta")
+    buf = io.BytesIO()
+    exp = export_df()
+    exp.to_excel(buf, index=False, sheet_name="Produttori")
+    st.download_button("⬇️ Scarica Excel", buf.getvalue(), "cantina.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("⬇️ Scarica backup completo (JSON)", json.dumps(dump(), ensure_ascii=False, default=str), "cantina_backup.json", "application/json")
+    bk = st.file_uploader("Ripristina da backup JSON", type="json", key="bk")
+    if bk and st.button("♻️ Ripristina (sovrascrive tutto)"):
+        restore(json.load(bk))
         autosave()
-        st.success("Ripristinato.")
         st.rerun()
+    if gh_conf() and st.button("Salva ora su GitHub"):
+        st.success("Salvato.") if push_backup() else st.error("Salvataggio non riuscito: controlla GITHUB_TOKEN e GITHUB_REPO.")
