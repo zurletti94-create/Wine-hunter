@@ -483,6 +483,20 @@ def export_df():
 
 
 # ───────────────────────── Schede ─────────────────────────
+FLAGS = {"Francia": "🇫🇷", "Italia": "🇮🇹", "Spagna": "🇪🇸", "Germania": "🇩🇪", "Austria": "🇦🇹", "Portogallo": "🇵🇹", "Svizzera": "🇨🇭",
+         "Slovenia": "🇸🇮", "Grecia": "🇬🇷", "Ungheria": "🇭🇺", "USA": "🇺🇸"}
+
+
+def flagged_zone(p):
+    return f"{FLAGS.get(p['country'], '')} {zone_of(p)}".strip()
+
+
+def type_class(t):
+    """Classe di colore per il tipo di vino (bianco, rosso, rosato, bolla, arancione, dolce)."""
+    c = norm(t)
+    return next((k for k in ("bianco", "rosso", "rosato", "bolla", "arancione", "dolce") if c.startswith(k[:4])), "")
+
+
 def shop_link(shop, text):
     url = (shop or {}).get("url")
     if not isinstance(url, str) or not url:
@@ -491,41 +505,91 @@ def shop_link(shop, text):
     if not href.startswith(("http://", "https://")):
         return ""
     label = "Cerca" if "{q}" in url else "Apri sito"
-    return f'<a href="{escape(href, quote=True)}" target="_blank" rel="noopener noreferrer">{label} ↗</a>'
+    return f'<a class="wh-btn" href="{escape(href, quote=True)}" target="_blank" rel="noopener noreferrer">{label} ↗</a>'
+
+
+def shop_home(shop):
+    url = (shop or {}).get("url")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return ""
+    return "/".join(url.split("/")[:3])
 
 
 def pcard(p, shop):
-    zone = zone_of(p) or "—"
-    chips = "".join(f"<span>{escape(t)}{' · ' + escape(g) if t and g else escape(g)}</span>" for t, g, _ in p["styles"] if t or g)
-    others = [s for s in p["sites"] if not shop or s != shop["name"]]
-    also = f'<div class="wh-note">Anche su: {escape(", ".join(others))}</div>' if others else ""
-    return (f'<div class="wh-card"><div class="wh-prod">{escape(zone)}</div><div class="wh-wine">{escape(p["name"])}</div>'
-            f'<div class="wh-tags">{chips}</div><div class="wh-foot"><span></span>{shop_link(shop, p["name"])}</div>{also}</div>')
+    zone = flagged_zone(p) or "Zona non indicata"
+    chips = "".join(f'<span class="chip t-{type_class(t)}">{escape(t)}{" · " + escape(g) if t and g else escape(g)}</span>' for t, g, _ in p["styles"] if t or g)
+    stripe = next((type_class(t) for t, _, _ in p["styles"] if type_class(t)), "none")
+    others = [x for x in p["sites"] if not shop or x != shop["name"]]
+    also = f'<span class="wh-also">Anche su: {escape(", ".join(others))}</span>' if others else '<span class="wh-also"></span>'
+    return (f'<div class="wh-card s-{stripe}"><div class="wh-name">{escape(p["name"])}</div><div class="wh-zone">{escape(zone)}</div>'
+            f'<div class="wh-tags">{chips}</div><div class="wh-foot">{also}{shop_link(shop, p["name"])}</div></div>')
+
+
+def cards_html(items, shop):
+    """Schede raggruppate per regione, con un'intestazione per ogni gruppo."""
+    items = sorted(items, key=lambda p: (p["country"].lower(), p["region"].lower(), p["name"].lower()))
+    counts = {}
+    for p in items:
+        counts[(p["country"], p["region"])] = counts.get((p["country"], p["region"]), 0) + 1
+    out, last = [], None
+    for p in items:
+        g = (p["country"], p["region"])
+        if g != last:
+            label = p["region"] or p["country"] or "Zona non indicata"
+            out.append(f'<div class="wh-group">{FLAGS.get(p["country"], "")} {escape(label)}<small>{counts[g]}</small></div>')
+            last = g
+        out.append(pcard(p, shop))
+    return '<div class="wh-grid">' + "".join(out) + "</div>"
 
 
 CSS = """<style>
-:root{--wine:#A6264A;--wine-d:#7E1B38;--line:rgba(127,127,127,.28);--soft:rgba(127,127,127,.09)}
-.block-container{padding-top:2rem;padding-bottom:3rem;max-width:1100px}
-@media (max-width:640px){.block-container{padding-left:.8rem;padding-right:.8rem}}
-h1,h2,h3{font-family:Georgia,'Times New Roman',serif}
-.wh-hero h1{margin:0;padding:0;font-size:2rem;color:var(--wine)}
-.wh-hero p{margin:.1rem 0 .8rem;opacity:.7}
-.wh-kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;margin-bottom:.8rem}
-.wh-kpi div{background:var(--soft);border:1px solid var(--line);border-radius:12px;padding:.5rem .7rem;text-align:center}
-.wh-kpi b{display:block;font-size:1.35rem;font-family:Georgia,serif;color:var(--wine)}
-.wh-kpi span{font-size:.72rem;opacity:.7;text-transform:uppercase;letter-spacing:.04em}
-.wh-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:.7rem}
-.wh-card{background:var(--soft);border:1px solid var(--line);border-left:4px solid var(--wine);border-radius:12px;padding:.8rem .9rem}
-.wh-prod{font-size:.78rem;opacity:.7;text-transform:uppercase;letter-spacing:.05em}
-.wh-wine{font-family:Georgia,serif;font-size:1.1rem;font-weight:600;line-height:1.25;margin:.1rem 0 .4rem}
-.wh-tags span{display:inline-block;font-size:.72rem;border:1px solid var(--line);border-radius:99px;padding:.05rem .5rem;margin:0 .3rem .2rem 0}
-.wh-foot{display:flex;justify-content:space-between;align-items:center;margin-top:.4rem;font-size:.85rem}
-.wh-foot a{color:var(--wine);font-weight:600;text-decoration:none}
-.wh-note{margin-top:.3rem;font-size:.75rem;opacity:.65}
-button[kind="primary"],button[data-testid="stBaseButton-primary"]{background:var(--wine);border-color:var(--wine);color:#fff}
-button[kind="primary"]:hover,button[data-testid="stBaseButton-primary"]:hover{background:var(--wine-d);border-color:var(--wine-d);color:#fff}
-.stTabs [aria-selected="true"]{color:var(--wine)}
-.stTabs [data-baseweb="tab-highlight"]{background-color:var(--wine)}
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&display=swap');
+:root{--wine:#A6264A;--wine-d:#7E1B38;--wine-dd:#4E0F23;--line:rgba(127,127,127,.26);--soft:rgba(127,127,127,.08)}
+.block-container{padding-top:1.2rem;padding-bottom:4rem;max-width:1080px}
+@media (max-width:640px){.block-container{padding-left:.75rem;padding-right:.75rem}}
+footer{visibility:hidden}
+h1,h2,h3{font-family:'Playfair Display',Georgia,'Times New Roman',serif}
+.wh-hero{background:linear-gradient(135deg,var(--wine-dd) 0%,var(--wine-d) 55%,var(--wine) 100%);color:#fff;border-radius:18px;padding:1.1rem 1.2rem 1rem;margin:0 0 .9rem;box-shadow:0 6px 18px rgba(78,15,35,.25)}
+.wh-hero h1{margin:0!important;padding:0!important;font-size:1.9rem!important;line-height:1.1!important;color:#fff!important}
+.wh-hero p{margin:.25rem 0 .8rem;opacity:.85;font-size:.92rem;color:#fff}
+.wh-kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem}
+.wh-kpi div{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);border-radius:12px;padding:.45rem .5rem;text-align:center}
+.wh-kpi b{display:block;font-family:'Playfair Display',Georgia,serif;font-size:1.4rem;color:#fff;line-height:1.1}
+.wh-kpi span{font-size:.66rem;text-transform:uppercase;letter-spacing:.08em;color:#fff;opacity:.85}
+.wh-sitehead{display:flex;align-items:baseline;gap:.7rem;flex-wrap:wrap;margin:.7rem 0 .2rem}
+.wh-sitehead h2{margin:0!important;padding:0!important;font-size:1.55rem!important;color:var(--wine)}
+.wh-sitehead span{font-size:.85rem;opacity:.7}
+.wh-sitehead a{color:var(--wine);font-weight:600;text-decoration:none;font-size:.85rem}
+.wh-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:.75rem}
+.wh-group{grid-column:1/-1;display:flex;align-items:center;gap:.5rem;margin:.7rem 0 .05rem;font-family:'Playfair Display',Georgia,serif;font-size:1.05rem;color:var(--wine)}
+.wh-group:after{content:"";flex:1;height:1px;background:var(--line)}
+.wh-group small{font-family:system-ui,sans-serif;font-size:.7rem;background:var(--soft);border:1px solid var(--line);border-radius:99px;padding:0 .45rem;color:inherit;opacity:.8}
+.wh-card{position:relative;background:var(--soft);border:1px solid var(--line);border-radius:16px;padding:.8rem .95rem .75rem 1.1rem;box-shadow:0 1px 3px rgba(0,0,0,.06);overflow:hidden}
+.wh-card:before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:var(--wine)}
+.s-bianco:before{background:#D9B44A}.s-rosso:before{background:#A6264A}.s-rosato:before{background:#E88AA8}
+.s-bolla:before{background:#7DC1CB}.s-arancione:before{background:#E08A2E}.s-dolce:before{background:#C79A3E}
+.wh-name{font-family:'Playfair Display',Georgia,serif;font-size:1.12rem;font-weight:600;line-height:1.25}
+.wh-zone{font-size:.8rem;opacity:.72;margin:.1rem 0 .45rem}
+.chip{display:inline-block;font-size:.72rem;border:1px solid var(--line);border-radius:99px;padding:.08rem .55rem;margin:0 .3rem .25rem 0}
+.t-bianco{background:rgba(217,180,74,.20);border-color:rgba(217,180,74,.6)}
+.t-rosso{background:rgba(166,38,74,.16);border-color:rgba(166,38,74,.5)}
+.t-rosato{background:rgba(232,138,168,.22);border-color:rgba(232,138,168,.6)}
+.t-bolla{background:rgba(125,193,203,.20);border-color:rgba(125,193,203,.6)}
+.t-arancione{background:rgba(224,138,46,.20);border-color:rgba(224,138,46,.6)}
+.t-dolce{background:rgba(199,154,62,.22);border-color:rgba(199,154,62,.6)}
+.wh-foot{display:flex;justify-content:space-between;align-items:center;gap:.6rem;margin-top:.3rem}
+.wh-also{font-size:.74rem;opacity:.65;flex:1}
+.wh-btn{display:inline-block;background:var(--wine);color:#fff!important;border-radius:99px;padding:.28rem .85rem;font-size:.8rem;font-weight:600;text-decoration:none!important;white-space:nowrap}
+.stTabs [data-baseweb="tab-list"]{gap:.15rem;border-bottom:1px solid var(--line)}
+.stTabs [data-baseweb="tab"]{height:2.6rem;padding:0 .7rem;border-radius:10px 10px 0 0;font-weight:500}
+.stTabs [aria-selected="true"]{color:var(--wine)!important;font-weight:700}
+.stTabs [data-baseweb="tab-highlight"]{background-color:var(--wine);height:3px}
+.stButton>button,.stDownloadButton>button{border-radius:12px;font-weight:600}
+button[kind="primary"],button[data-testid="stBaseButton-primary"]{background:linear-gradient(135deg,var(--wine-d),var(--wine));border:0;color:#fff}
+button[kind="primary"]:hover,button[data-testid="stBaseButton-primary"]:hover{filter:brightness(1.1);color:#fff}
+div[data-baseweb="select"]>div,div[data-baseweb="input"]>div,div[data-baseweb="textarea"]>div{border-radius:12px!important}
+div[data-testid="stExpander"]{border-radius:14px;border:1px solid var(--line)}
+div[data-testid="stDataFrame"]{border-radius:12px;overflow:hidden}
 </style>"""
 
 
@@ -623,10 +687,10 @@ for _k, _v in (("fv", 0), ("tv", 0), ("confirm", None), ("ov", None), ("sug", No
     st.session_state.setdefault(_k, _v)
 st.markdown(CSS, unsafe_allow_html=True)
 _n = lambda sql: int(q(sql).iloc[0, 0])
-st.markdown('<div class="wh-hero"><h1>🍷 Cantina</h1><p>Produttori e siti dove sei certo di trovare i loro vini</p></div>'
+st.markdown('<div class="wh-hero"><h1>🍷 Cantina</h1><p>Produttori e siti dove sei certo di trovare i loro vini</p>'
             '<div class="wh-kpi">' + "".join(f"<div><b>{v}</b><span>{k}</span></div>" for k, v in (
                 ("Produttori", _n("SELECT COUNT(*) FROM producers")), ("Siti", _n("SELECT COUNT(*) FROM shops")),
-                ("Collegamenti", _n("SELECT COUNT(*) FROM avail")))) + "</div>", unsafe_allow_html=True)
+                ("Collegamenti", _n("SELECT COUNT(*) FROM avail")))) + "</div></div>", unsafe_allow_html=True)
 t1, t2, t3, t4 = st.tabs(["🛒 Per sito", "📒 Produttori", "🌐 Siti", "💾 Dati"])
 allp = load_all()
 shops_df = q("SELECT id,name,country,url FROM shops ORDER BY name COLLATE NOCASE")
@@ -654,9 +718,14 @@ with t1:
         items = [p for p in items if (not txt or norm(txt) in norm(p["name"])) and (not f_c or p["country"] in f_c)
                  and (not f_r or p["region"] in f_r) and (not f_s or p["subregion"] in f_s)
                  and (not f_t or any(t in f_t for t, _, _ in p["styles"])) and (not f_u or any(g in f_u for _, g, _ in p["styles"]))]
-        st.caption(f"{len(items)} produttori")
+        home = shop_home(shop)
+        st.markdown(f'<div class="wh-sitehead"><h2>{escape("Senza sito assegnato" if sel == NONE else sel)}</h2>'
+                    f'<span>{len(items)} produttori</span>' + (f'<a href="{escape(home, quote=True)}" target="_blank" rel="noopener noreferrer">Apri sito ↗</a>' if home else "")
+                    + "</div>", unsafe_allow_html=True)
         if items:
-            st.markdown('<div class="wh-grid">' + "".join(pcard(p, shop) for p in items) + "</div>", unsafe_allow_html=True)
+            st.markdown(cards_html(items, shop), unsafe_allow_html=True)
+        else:
+            st.info("Nessun produttore con questi filtri.")
 
 # ── Produttori
 with t2:
@@ -672,7 +741,7 @@ with t2:
         st.caption(f"{len(view)} produttori · tocca una riga per aprire la scheda")
         if view:
             table = pd.DataFrame({"Produttore": [p["name"] for p in view],
-                                  "Zona": [zone_of(p) for p in view],
+                                  "Zona": [flagged_zone(p) for p in view],
                                   "Tipi e uve": [styles_text(p) for p in view],
                                   "Siti": [", ".join(p["sites"]) for p in view]})
             ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row",
