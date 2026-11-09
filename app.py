@@ -43,9 +43,13 @@ def db():
 def q(sql, p=()):
     con = db()
     try:
-        return pd.read_sql_query(sql, con, params=p)
+        df = pd.read_sql_query(sql, con, params=p)
     finally:
         con.close()
+    for c in df.columns:  # con pandas recente i testi vuoti (NULL) diventano NaN, che in Python vale «vero»: li riporto a None
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = df[c].astype(object).where(df[c].notna(), None)
+    return df
 
 
 def init():
@@ -319,7 +323,7 @@ def load_all():
 
 
 def zone_of(p):
-    return " · ".join(x for x in (p["country"], p["region"], p["subregion"]) if x)
+    return " · ".join(x for x in (p["country"], p["region"], p["subregion"]) if isinstance(x, str) and x)
 
 
 def styles_text(p, with_wine=False):
@@ -480,8 +484,8 @@ def export_df():
 
 # ───────────────────────── Schede ─────────────────────────
 def shop_link(shop, text):
-    url = (shop or {}).get("url") or ""
-    if not url:
+    url = (shop or {}).get("url")
+    if not isinstance(url, str) or not url:
         return ""
     href = url.replace("{q}", quote_plus(text))
     if not href.startswith(("http://", "https://")):
