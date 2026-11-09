@@ -3,6 +3,7 @@ import io
 import json
 import re
 import sqlite3
+import time
 import unicodedata
 from datetime import datetime
 from difflib import get_close_matches
@@ -66,6 +67,169 @@ def secret(k, d=None):
         return st.secrets.get(k, d)
     except Exception:
         return d
+
+
+# ───────────────────────── Compilazione automatica (Gemini o Claude) ─────────────────────────
+def parse_json(text):
+    """Legge il primo oggetto JSON nel testo (ignora recinzioni ``` e commenti prima o dopo)."""
+    return json.JSONDecoder().raw_decode(text[text.index("{"):])[0]
+
+
+GEM = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def gemini_candidates():
+    """Modelli da provare: GEMINI_MODEL se impostato, altrimenti quelli 'flash' disponibili per la tua chiave."""
+    if secret("GEMINI_MODEL"):
+        return [secret("GEMINI_MODEL")]
+    r = requests.get(f"{GEM}/models?pageSize=200", headers={"x-goog-api-key": secret("GEMINI_API_KEY")}, timeout=20)
+    r.raise_for_status()
+    names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+             if "generateContent" in m.get("supportedGenerationMethods", [])]
+    bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "native", "thinking", "exp", "deep")
+    cand = [n for n in names if n.startswith("gemini-") and "flash" in n and not any(x in n for x in bad)]
+
+    def rank(n):
+        v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return (not n.endswith("-latest"), "preview" in n, "lite" in n, -(float(v.group(1)) if v else 0))
+    return sorted(cand, key=rank)[:4]
+
+
+def gemini_call(prompt, grounded=False):
+    """Ritorna (testo, fonti). grounded=True attiva la ricerca Google di Gemini e restituisce le pagine consultate."""
+    last, fixed = "nessun modello 'flash' trovato per questa chiave", bool(secret("GEMINI_MODEL"))
+    try:
+        models = gemini_candidates()
+    except requests.exceptions.RequestException:
+        raise RuntimeError("Google non risponde in questo momento: riprova tra un minuto.")
+    for model in (models[:2] if grounded else models):
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        if grounded:
+            body["tools"] = [{"google_search": {}}]
+        else:
+            body["generationConfig"] = {"responseMimeType": "application/json"}
+        r = None
+        for attempt in range(2):  # un secondo tentativo se Google è momentaneamente sovraccarico
+            try:
+                r = requests.post(f"{GEM}/models/{model}:generateContent",
+                                  headers={"x-goog-api-key": secret("GEMINI_API_KEY"), "Content-Type": "application/json"},
+                                  json=body, timeout=(10, 60 if grounded else 30))
+            except requests.exceptions.RequestException:  # nessuna risposta in tempo: passo al modello successivo
+                r = None
+                break
+            if r.status_code in (500, 502, 503, 504) and attempt == 0:
+                time.sleep(2)
+                continue
+            break
+        if r is None or r.status_code in (403, 404, 429, 500, 502, 503, 504):
+            last = f"{model}: " + ("nessuna risposta in tempo" if r is None else f"errore {r.status_code}")
+            if fixed:
+                break
+            continue
+        r.raise_for_status()
+        cand = r.json()["candidates"][0]
+        text = "".join(p.get("text", "") for p in cand["content"]["parts"])
+        chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
+        sources = [{"title": c["web"].get("title", ""), "uri": c["web"]["uri"]} for c in chunks if c.get("web", {}).get("uri")]
+        return text, sources
+    raise RuntimeError(f"Gemini non ha risposto ({last}). Riprova tra un minuto; "
+                       "altrimenti usa «Incolla i dati da una chat» oppure controlla chiave e modello nei Secrets.")
+
+
+def snap_to(value, pool, cutoff=0.85):
+    """Riporta un valore a quello già in uso nella rubrica (stessa grafia), se è molto simile."""
+    v, m = " ".join(str(value or "").split()), {p.lower(): p for p in pool if p}
+    hit = get_close_matches(v.lower(), list(m), 1, cutoff)
+    return m[hit[0]] if hit else v
+
+
+def latin(v):
+    return all(unicodedata.name(ch, "").startswith("LATIN") for ch in v if ch.isalpha())
+
+
+ALIAS = {"france": "Francia", "italy": "Italia", "spain": "Spagna", "germany": "Germania", "deutschland": "Germania", "osterreich": "Austria",
+         "loire": "Loira", "loire valley": "Loira", "burgundy": "Borgogna", "bourgogne": "Borgogna", "rhone": "Rodano", "rhone valley": "Rodano",
+         "tuscany": "Toscana", "piedmont": "Piemonte", "sicily": "Sicilia", "sardinia": "Sardegna", "lombardy": "Lombardia",
+         "apulia": "Puglia", "south tyrol": "Alto Adige", "sudtirol": "Alto Adige", "styria": "Steiermark", "steiermark": "Steiermark",
+         "lower austria": "Niederösterreich", "niederosterreich": "Niederösterreich", "canary islands": "Canarie", "basque country": "Paesi Baschi"}
+
+
+def norm_type(t, types):
+    c = norm(t)
+    for key, val in (("bianco", "Bianco"), ("white", "Bianco"), ("blanc", "Bianco"), ("weiss", "Bianco"),
+                     ("rosso", "Rosso"), ("red", "Rosso"), ("rouge", "Rosso"), ("rot", "Rosso"), ("rosato", "Rosato"), ("rose", "Rosato"),
+                     ("bolla", "Bolla"), ("spumante", "Bolla"), ("sparkling", "Bolla"), ("champagne", "Bolla"), ("mousseux", "Bolla"),
+                     ("cremant", "Bolla"), ("sekt", "Bolla"), ("bulles", "Bolla"), ("arancio", "Arancione"), ("orange", "Arancione"),
+                     ("dolce", "Dolce"), ("sweet", "Dolce"), ("liquoroso", "Dolce")):
+        if c.startswith(key):
+            return val
+    return snap_to(t, types)
+
+
+def autofill_prompt(producer, opts, web=False):
+    lists = (f"Paesi già in uso: {', '.join(opts['countries'][:30])}. Regioni già in uso: {', '.join(opts['regions'][:60])}. "
+             f"Uve già in uso: {', '.join(opts['grapes'][:60])}. ")
+    return (f"""Sei un sommelier esperto. Per il produttore di vino "{producer}" rispondi SOLO con JSON valido, senza altro testo:
+{{"country":"","region":"","subregion":"","styles":[{{"type":"Bianco|Rosso|Rosato|Bolla|Arancione|Dolce","grape":""}}]}}
+""" + ("Usa la ricerca web (sito ufficiale, guide, negozi specializzati) per verificare le informazioni. " if web else "") + f"""
+- country e region: in italiano dove esiste la forma italiana (es. Francia, Borgogna, Loira, Toscana). {lists}Se un valore coincide con uno già in uso, scrivilo identico.
+- subregion: la provincia o sotto-regione/denominazione principale, nel nome originale (es. Saumur, Südsteiermark, Côte de Nuits).
+- styles: i tipi di vino e le uve principali che il produttore lavora davvero (max 8 coppie), una coppia tipo+uva per riga, con il nome comune dell'uva (es. Chenin Blanc, Pinot Nero).
+- Includi solo ciò di cui sei certo: se non conosci il produttore rispondi {{"error":"sconosciuto"}}.""")
+
+
+def autofill(producer, opts):
+    """Ritorna un dizionario con country, region, subregion, styles e '_sources' (pagine web consultate), oppure None se manca la chiave."""
+    if secret("ANTHROPIC_API_KEY"):
+        import anthropic
+        r = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY")).messages.create(
+            model=secret("ANTHROPIC_MODEL", "claude-sonnet-5-5"), max_tokens=1500,
+            messages=[{"role": "user", "content": autofill_prompt(producer, opts)}])
+        return {**parse_json(r.content[0].text), "_sources": []}
+    if secret("GEMINI_API_KEY"):
+        res, sources = None, []
+        try:
+            text, sources = gemini_call(autofill_prompt(producer, opts, web=True), grounded=True)
+            res = parse_json(text)
+        except Exception:
+            res, sources = None, []
+        if res is None:
+            res = parse_json(gemini_call(autofill_prompt(producer, opts))[0])
+        return {**res, "_sources": sources}
+    return None
+
+
+def clean_suggestion(res, opts):
+    """Allinea la proposta ai valori già usati (paesi, regioni, tipi, uve) e scarta nomi con alfabeti non latini."""
+    pairs, seen = [], set()
+    for x in (res.get("styles") or [])[:12]:
+        t, g = norm_type(x.get("type", ""), opts["types"]), snap_to(x.get("grape", ""), opts["grapes"], 0.88)
+        if (t or g) and latin(t + g) and (norm(t), norm(g)) not in seen:
+            seen.add((norm(t), norm(g)))
+            pairs.append((t, g))
+    al = lambda v: ALIAS.get(norm(v), " ".join(str(v or "").split()))
+    return {"country": snap_to(al(res.get("country")), opts["countries"], 0.8), "region": snap_to(al(res.get("region")), opts["regions"], 0.8),
+            "subregion": snap_to(res.get("subregion"), opts["subs"], 0.9), "styles": pairs, "sources": res.get("_sources", [])}
+
+
+def merge_suggestion(snap, sug, overwrite):
+    """Applica la proposta ai campi del modulo: di norma solo ai campi vuoti e aggiungendo i tipi/uve mancanti.
+    Se la proposta contraddice paese o regione già inseriti non applica nulla. Ritorna (campi, avviso)."""
+    out = dict(snap)
+    if not overwrite:
+        for k, lab in (("country", "il paese"), ("region", "la regione")):
+            if snap[k] and sug[k] and norm(snap[k]) != norm(sug[k]):
+                return out, (f"La proposta indica {lab} «{sug[k]}», diverso da «{snap[k]}» che hai già inserito: non ho applicato nulla. "
+                             "Se vuoi usarla, spunta «Sostituisci anche i campi già compilati» e riprova.")
+    for k in ("country", "region", "subregion"):
+        if sug[k] and (overwrite or not snap[k]):
+            out[k] = sug[k]
+    rows = [r for r in snap["styles"] if any(r)]
+    if overwrite:
+        rows = [r for r in rows if r[2]]  # restano solo le righe con un nome di vino scritto da te
+    have = {(norm(t), norm(g)) for t, g, _ in rows}
+    out["styles"] = rows + [(t, g, "") for t, g in sug["styles"] if (norm(t), norm(g)) not in have]
+    return out, ""
 
 
 # ───────────────────────── Salvataggio permanente (repository GitHub privato) ─────────────────────────
@@ -371,19 +535,63 @@ def pick(box, label, options, current, key):
 
 def producer_form(pid, allp, shops):
     cur = next((p for p in allp if p["id"] == pid), None) if pid else None
-    k = f"pf{pid or 'new'}_{st.session_state.fv}"
-    name = st.text_input("Produttore", cur["name"] if cur else "", key=k + "n")
+    key_id = pid or "new"
+    if st.session_state.get("ov_owner") != key_id:  # cambiando produttore, le proposte non salvate vengono dimenticate
+        st.session_state.ov, st.session_state.sug, st.session_state.ov_owner = None, None, key_id
+    base = st.session_state.ov or (cur or {"name": "", "country": "", "region": "", "subregion": "", "notes": "", "styles": [], "sites": []})
+    k = f"pf{key_id}_{st.session_state.fv}"
+    has_key = bool(secret("GEMINI_API_KEY") or secret("ANTHROPIC_API_KEY"))
+    name = st.text_input("Produttore", base["name"], key=k + "n")
+    ai_click = st.button("✨ Compila automaticamente", key=k + "ai", disabled=not (name.strip() and has_key),
+                         help="Propone paese, regione, provincia, tipi di vino e uve: controlla sempre prima di salvare")
+    if not has_key:
+        st.caption("Per la compilazione automatica serve una chiave GEMINI_API_KEY nei Secrets.")
+    overwrite = st.checkbox("Sostituisci anche i campi già compilati", key=k + "ow") if cur else False
     c1, c2 = st.columns(2)
-    country = pick(c1, "Paese", [p["country"] for p in allp] + KNOWN_COUNTRIES, cur["country"] if cur else "", k + "c")
-    region = pick(c2, "Regione", [p["region"] for p in allp], cur["region"] if cur else "", k + "r")
-    subregion = pick(st, "Provincia / sotto-regione", [p["subregion"] for p in allp], cur["subregion"] if cur else "", k + "p")
+    country = pick(c1, "Paese", [p["country"] for p in allp] + KNOWN_COUNTRIES, base["country"], k + "c")
+    region = pick(c2, "Regione", [p["region"] for p in allp], base["region"], k + "r")
+    subregion = pick(st, "Provincia / sotto-regione", [p["subregion"] for p in allp], base["subregion"], k + "p")
     types = sorted({t for p in allp for t, _, _ in p["styles"] if t} | set(BASE_TYPES))
     st.markdown("**Vini**")
-    wdf = pd.DataFrame([(w, t, g) for t, g, w in cur["styles"]] if cur else [], columns=["Vino", "Tipo", "Uva"])
+    wdf = pd.DataFrame([(w, t, g) for t, g, w in base["styles"]], columns=["Vino", "Tipo", "Uva"])
     wdf = st.data_editor(wdf, num_rows="dynamic", hide_index=True, use_container_width=True, key=k + "s",
                          column_config={"Vino": "Vino", "Tipo": st.column_config.SelectboxColumn("Tipo", options=types), "Uva": "Uva"})
-    sites = st.multiselect("🛒 Siti dove hai verificato che li trovi", [s["name"] for s in shops], default=cur["sites"] if cur else [], key=k + "w")
-    notes = st.text_area("Note", cur["notes"] if cur else "", key=k + "t", height=80)
+    sites = st.multiselect("🛒 Siti dove hai verificato che li trovi", [s["name"] for s in shops], default=base["sites"], key=k + "w")
+    notes = st.text_area("Note", base["notes"], key=k + "t", height=80)
+    styles = [(_cl(t), _cl(g), _cl(w)) for w, t, g in wdf[["Vino", "Tipo", "Uva"]].itertuples(index=False)]
+    if ai_click:
+        opts = {"countries": sorted({p["country"] for p in allp if p["country"]} | set(KNOWN_COUNTRIES)),
+                "regions": sorted({p["region"] for p in allp if p["region"]}), "subs": sorted({p["subregion"] for p in allp if p["subregion"]}),
+                "types": types, "grapes": sorted({g for p in allp for _, g, _ in p["styles"] if g})}
+        res = None
+        with st.spinner("Ricerca in corso… può richiedere fino a un minuto"):
+            try:
+                res = autofill(name.strip(), opts)
+            except Exception as e:
+                st.error(f"Errore: {e}")
+        if res is not None:
+            if res.get("error"):
+                st.warning("Produttore non riconosciuto: compila a mano.")
+            else:
+                sug = clean_suggestion(res, opts)
+                snap = {"name": name.strip(), "country": country, "region": region, "subregion": subregion, "notes": notes,
+                        "styles": styles, "sites": sites}
+                merged, sug["note"] = merge_suggestion(snap, sug, overwrite)
+                st.session_state.ov, st.session_state.sug = merged, sug
+                st.session_state.fv += 1
+                st.rerun()
+    sug = st.session_state.sug
+    if sug and sug.get("note"):
+        st.warning(sug["note"])
+    if sug:
+        with st.expander("🤖 Proposta ricevuta: da controllare", expanded=False):
+            st.write(f"**Zona:** {' · '.join(x for x in (sug['country'], sug['region'], sug['subregion']) if x) or '—'}")
+            st.write("**Tipi e uve:** " + (", ".join(f"{t} {g}".strip() for t, g in sug["styles"]) or "—"))
+            if sug["sources"]:
+                st.markdown("**Fonti consultate sul web:**\n" + "\n".join(
+                    "- [" + (x["title"] or x["uri"]).replace("[", "(").replace("]", ")") + "](" + x["uri"] + ")" for x in sug["sources"][:10]))
+            else:
+                st.caption("Nessuna fonte web: la proposta viene dalla memoria del modello e può contenere errori.")
     ex = find_producer(name, allp) if not pid and name.strip() else None
     if ex:
         st.info(f"📎 «{ex['name']}» è già in rubrica: salvando verranno aggiunti solo vini e siti nuovi, senza togliere nulla.")
@@ -392,9 +600,9 @@ def producer_form(pid, allp, shops):
             st.error("Inserisci il nome del produttore.")
         else:
             try:
-                styles = [(_cl(t), _cl(g), _cl(w)) for w, t, g in wdf[["Vino", "Tipo", "Uva"]].itertuples(index=False)]
                 save_producer(pid, name.strip(), country, region, subregion, notes.strip(), styles, sites, merge_into=ex["id"] if ex else None)
                 autosave()
+                st.session_state.ov, st.session_state.sug = None, None
                 st.session_state.fv += 1
                 st.session_state.tv += 1
                 st.toast("Salvato ✅")
@@ -407,7 +615,7 @@ def producer_form(pid, allp, shops):
 st.set_page_config(page_title="Cantina", page_icon="🍷", layout="wide")
 init()
 first_boot()
-for _k, _v in (("fv", 0), ("tv", 0), ("confirm", None)):
+for _k, _v in (("fv", 0), ("tv", 0), ("confirm", None), ("ov", None), ("sug", None), ("ov_owner", None)):
     st.session_state.setdefault(_k, _v)
 st.markdown(CSS, unsafe_allow_html=True)
 _n = lambda sql: int(q(sql).iloc[0, 0])
