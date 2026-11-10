@@ -742,7 +742,6 @@ with t2:
         if view:
             table = pd.DataFrame({"Produttore": [p["name"] for p in view],
                                   "Zona": [flagged_zone(p) for p in view],
-                                  "Tipi e uve": [styles_text(p) for p in view],
                                   "Siti": [", ".join(p["sites"]) for p in view]})
             ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row",
                               key=f"ptbl_{st.session_state.tv}_{txt.strip()}")
