@@ -605,23 +605,15 @@ CSS_MORE = """<style>
 div[data-testid="stRadio"] [role="radiogroup"]{gap:.5rem}
 </style>"""
 CSS_THEME = """<style>
-:root{--card:rgba(255,255,255,.62)}
-.stApp{--bg:#F4EAD8;background:var(--bg)!important}
+:root{--card:rgba(255,255,255,.66)}
+.stApp{background:#FBF5E8!important}
 [data-testid="stAppViewContainer"],[data-testid="stMain"],[data-testid="stHeader"]{background:transparent!important}
-.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(2)[aria-selected="true"]){--bg:#F0E1C8}
-.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(3)[aria-selected="true"]){--bg:#E6ECDC}
-.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(4)[aria-selected="true"]){--bg:#E9E0D6}
 .wh-card,.wh-detail{background:var(--card)}
-div[data-baseweb="select"]>div,div[data-baseweb="input"]>div,div[data-baseweb="textarea"]>div,div[data-testid="stExpander"]{background-color:rgba(255,255,255,.55)!important}
 [class*="st-key-newprod"] button{background:rgba(166,38,74,.09)!important;color:var(--wine)!important;border:1.5px solid rgba(166,38,74,.40)!important}
 [class*="st-key-newprod"] button:hover{background:rgba(166,38,74,.17)!important}
 @media (prefers-color-scheme: dark){
 :root{--card:rgba(255,255,255,.06)}
-.stApp{--bg:#2B241B}
-.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(2)[aria-selected="true"]){--bg:#2E2417}
-.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(3)[aria-selected="true"]){--bg:#1F2A22}
-.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(4)[aria-selected="true"]){--bg:#272220}
-div[data-baseweb="select"]>div,div[data-baseweb="input"]>div,div[data-baseweb="textarea"]>div,div[data-testid="stExpander"]{background-color:rgba(255,255,255,.07)!important}
+.stApp{background:#2B241B!important}
 [class*="st-key-newprod"] button{background:rgba(232,138,168,.12)!important;color:#F2B3C6!important;border-color:rgba(232,138,168,.45)!important}
 }
 </style>"""
@@ -639,8 +631,9 @@ input,textarea,[data-baseweb="select"] input,[data-baseweb="select"] div{font-si
 .chip{font-size:.8rem;padding:.12rem .7rem}
 .wh-btn{padding:.5rem 1.1rem;font-size:.95rem}
 .wh-sitehead h2{font-size:1.35rem!important}
-[class*="st-key-prow"] button{justify-content:flex-start;text-align:left;height:auto;min-height:3.4rem;padding:.65rem .9rem;border-radius:14px;white-space:normal;line-height:1.3;font-weight:500}
-[class*="st-key-prow"] button p{text-align:left}
+.st-key-plist[data-testid="stVerticalBlock"],.st-key-plist>[data-testid="stVerticalBlock"]{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:.5rem!important}
+[class*="st-key-prow"] button{justify-content:flex-start!important;text-align:left!important;height:auto;min-height:2.9rem;padding:.45rem .7rem;border-radius:12px;white-space:normal;line-height:1.2;font-size:.92rem;font-weight:500}
+[class*="st-key-prow"] button p{text-align:left!important;margin:0}
 div[data-testid="stExpander"] summary{padding:.75rem .9rem}
 </style>"""
 CSS_PC = """<style>
@@ -899,11 +892,11 @@ def producers_list_phone():
         st.session_state.last_txt, st.session_state.limit = txt, 40
     view = filter_view(txt)
     st.caption(f"{len(view)} produttori")
-    for p in view[:st.session_state.limit]:
-        label = f"{FLAGS.get(p['country'], '🍷')}  {p['name']}" + (f"  ·  {p['region']}" if p["region"] else "")
-        if st.button(label, key=f"prow{p['id']}", use_container_width=True):
-            go(p["id"])
-            st.rerun()
+    with st.container(key="plist"):
+        for p in view[:st.session_state.limit]:
+            if st.button(f"{FLAGS.get(p['country'], '🍷')} {p['name']}", key=f"prow{p['id']}", use_container_width=True):
+                go(p["id"])
+                st.rerun()
     if len(view) > st.session_state.limit and st.button(f"Mostra altri ({len(view) - st.session_state.limit})", key="more", use_container_width=True):
         st.session_state.limit += 40
         st.rerun()
@@ -917,7 +910,7 @@ def producers_list_pc():
     view = filter_view(txt)
     st.caption(f"{len(view)} produttori · clicca una riga per aprirla")
     if view:
-        table = pd.DataFrame({"Produttore": [p["name"] for p in view], "Zona": [flagged_zone(p) for p in view],
+        table = pd.DataFrame({"Produttore": [f"{FLAGS.get(p['country'], '🍷')} {p['name']}" for p in view],
                               "Siti": [", ".join(p["sites"]) for p in view]})
         ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row",
                           height=560, key=f"ptbl_{st.session_state.tv}_{txt.strip()}")
