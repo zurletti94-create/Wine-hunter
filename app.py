@@ -593,6 +593,103 @@ div[data-testid="stDataFrame"]{border-radius:12px;overflow:hidden}
 </style>"""
 
 
+CSS_MORE = """<style>
+.wh-detail{background:var(--soft);border:1px solid var(--line);border-radius:18px;padding:1rem 1.05rem;margin:.2rem 0 .8rem}
+.wh-detail .wh-name{font-size:1.45rem}
+.wh-sec{font-size:.72rem;text-transform:uppercase;letter-spacing:.09em;opacity:.65;margin:.9rem 0 .3rem}
+.wh-line{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .5rem;margin:.25rem 0}
+.wh-line b{font-family:'Playfair Display',Georgia,serif;font-weight:600}
+.wh-sites{display:flex;flex-wrap:wrap;gap:.45rem}
+.wh-sites .chip{margin:0;font-size:.85rem;padding:.35rem .85rem}
+.wh-notes{font-size:.9rem;opacity:.85;white-space:pre-wrap}
+div[data-testid="stRadio"] [role="radiogroup"]{gap:.5rem}
+</style>"""
+CSS_PHONE = """<style>
+html{-webkit-text-size-adjust:100%}
+.block-container{padding-top:3.2rem!important;padding-left:.7rem!important;padding-right:.7rem!important;padding-bottom:5rem!important}
+input,textarea,[data-baseweb="select"] input,[data-baseweb="select"] div{font-size:16px!important}
+.stButton>button,.stDownloadButton>button{min-height:3rem;font-size:1rem;border-radius:14px}
+.stTabs [data-baseweb="tab"]{height:3rem;font-size:.95rem;padding:0 .55rem}
+.wh-hero{padding:.8rem .95rem;border-radius:16px;margin-bottom:.6rem}
+.wh-hero h1{font-size:1.5rem!important}
+.wh-hero p{margin:.15rem 0 0;font-size:.85rem}
+.wh-grid{grid-template-columns:1fr}
+.wh-name{font-size:1.2rem}.wh-zone{font-size:.88rem}
+.chip{font-size:.8rem;padding:.12rem .7rem}
+.wh-btn{padding:.5rem 1.1rem;font-size:.95rem}
+.wh-sitehead h2{font-size:1.35rem!important}
+[class*="st-key-prow"] button{justify-content:flex-start;text-align:left;height:auto;min-height:3.4rem;padding:.65rem .9rem;border-radius:14px;white-space:normal;line-height:1.3;font-weight:500}
+[class*="st-key-prow"] button p{text-align:left}
+div[data-testid="stExpander"] summary{padding:.75rem .9rem}
+</style>"""
+CSS_PC = """<style>
+.block-container{max-width:1240px!important;padding-top:3.5rem!important}
+.wh-grid{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+.wh-hero{padding:1.3rem 1.6rem}
+.wh-hero h1{font-size:2.3rem!important}
+.wh-hero p{font-size:1rem}
+</style>"""
+
+
+def device_default():
+    """Telefono o computer in base al dispositivo che sta aprendo la pagina (si può cambiare con l'interruttore)."""
+    try:
+        ua = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        ua = ""
+    return "pc" if ua and not re.search(r"Mobile|iPhone|iPod|Android", ua) else "tel"
+
+
+def hero_html(phone, n_prod, n_shops, n_links):
+    if phone:
+        return f'<div class="wh-hero"><h1>🍷 Cantina</h1><p>{n_prod} produttori · {n_shops} siti · {n_links} collegamenti</p></div>'
+    return ('<div class="wh-hero"><h1>🍷 Cantina</h1><p>Produttori e siti dove sei certo di trovare i loro vini</p><div class="wh-kpi">'
+            + "".join(f"<div><b>{v}</b><span>{k}</span></div>" for k, v in (("Produttori", n_prod), ("Siti", n_shops), ("Collegamenti", n_links)))
+            + "</div></div>")
+
+
+def shop_pill(name, shop, text):
+    url = (shop or {}).get("url")
+    if isinstance(url, str) and url.startswith(("http://", "https://")):
+        href = url.replace("{q}", quote_plus(text))
+        return f'<a class="wh-btn" href="{escape(href, quote=True)}" target="_blank" rel="noopener noreferrer">{escape(name)} ↗</a>'
+    return f'<span class="chip">{escape(name)}</span>'
+
+
+def detail_html(p, shop_map):
+    """Scheda di sola lettura del produttore: zona, vini (nome, tipo, uva), siti con link e note."""
+    lines = "".join(
+        '<div class="wh-line">' + (f"<b>{escape(w)}</b>" if w else "")
+        + (f'<span class="chip t-{type_class(t)}">{escape(t)}{" · " + escape(g) if t and g else escape(g)}</span>' if t or g else "") + "</div>"
+        for t, g, w in p["styles"] if t or g or w)
+    sites = "".join(shop_pill(x, shop_map.get(x), p["name"]) for x in p["sites"])
+    return (f'<div class="wh-detail"><div class="wh-name">{escape(p["name"])}</div><div class="wh-zone">{escape(flagged_zone(p) or "Zona non indicata")}</div>'
+            + (f'<div class="wh-sec">Vini</div>{lines}' if lines else "")
+            + (f'<div class="wh-sec">Dove trovarli</div><div class="wh-sites">{sites}</div>' if sites else "")
+            + (f'<div class="wh-sec">Note</div><div class="wh-notes">{escape(p["notes"])}</div>' if p["notes"] else "") + "</div>")
+
+
+def save_shop(sid, name, country, url):
+    with db() as c:
+        if sid is None:
+            c.execute("INSERT INTO shops(name,country,url) VALUES(?,?,?)", (name, country, url))
+        else:
+            c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (name, country, url, sid))
+    autosave()
+
+
+def delete_shop(sid):
+    with db() as c:
+        c.execute("DELETE FROM shops WHERE id=?", (int(sid),))
+    autosave()
+
+
+def go(sel=None):
+    """Apre la scheda di un produttore (id), il modulo «nuovo» ('new') oppure torna all'elenco (None)."""
+    ss = st.session_state
+    ss.sel, ss.editing, ss.confirm, ss.last_tbl, ss.tv = sel, None, None, None, ss.tv + 1
+
+
 def pick(box, label, options, current, key):
     """Menu a tendina con i valori già usati (evita errori di battitura) e la voce «➕ Altro…» per i valori nuovi."""
     opts = sorted({o for o in options if o} | ({current} if current else set()), key=str.lower)
@@ -668,11 +765,11 @@ def producer_form(pid, allp, shops):
             st.error("Inserisci il nome del produttore.")
         else:
             try:
-                save_producer(pid, name.strip(), country, region, subregion, notes.strip(), styles, sites, merge_into=ex["id"] if ex else None)
+                saved = save_producer(pid, name.strip(), country, region, subregion, notes.strip(), styles, sites, merge_into=ex["id"] if ex else None)
                 autosave()
                 st.session_state.ov, st.session_state.sug = None, None
                 st.session_state.fv += 1
-                st.session_state.tv += 1
+                go(saved)
                 st.toast("Salvato ✅")
                 st.rerun()
             except sqlite3.IntegrityError:
@@ -683,14 +780,19 @@ def producer_form(pid, allp, shops):
 st.set_page_config(page_title="Cantina", page_icon="🍷", layout="wide")
 init()
 first_boot()
-for _k, _v in (("fv", 0), ("tv", 0), ("confirm", None), ("ov", None), ("sug", None), ("ov_owner", None)):
+for _k, _v in (("fv", 0), ("tv", 0), ("confirm", None), ("ov", None), ("sug", None), ("ov_owner", None), ("sel", None), ("editing", None),
+               ("last_tbl", None), ("last_txt", ""), ("limit", 40), ("confirm_shop", None)):
     st.session_state.setdefault(_k, _v)
-st.markdown(CSS, unsafe_allow_html=True)
+_opts = ["📱 Telefono", "💻 Computer"]
+if "vista" not in st.session_state:
+    st.session_state.vista = _opts[1] if (st.query_params.get("v") or device_default()) == "pc" else _opts[0]
+st.radio("Vista", _opts, horizontal=True, key="vista", label_visibility="collapsed")
+PHONE = st.session_state.vista == _opts[0]
+st.query_params["v"] = "tel" if PHONE else "pc"
+st.markdown(CSS + CSS_MORE + (CSS_PHONE if PHONE else CSS_PC), unsafe_allow_html=True)
 _n = lambda sql: int(q(sql).iloc[0, 0])
-st.markdown('<div class="wh-hero"><h1>🍷 Cantina</h1><p>Produttori e siti dove sei certo di trovare i loro vini</p>'
-            '<div class="wh-kpi">' + "".join(f"<div><b>{v}</b><span>{k}</span></div>" for k, v in (
-                ("Produttori", _n("SELECT COUNT(*) FROM producers")), ("Siti", _n("SELECT COUNT(*) FROM shops")),
-                ("Collegamenti", _n("SELECT COUNT(*) FROM avail")))) + "</div></div>", unsafe_allow_html=True)
+st.markdown(hero_html(PHONE, _n("SELECT COUNT(*) FROM producers"), _n("SELECT COUNT(*) FROM shops"), _n("SELECT COUNT(*) FROM avail")),
+            unsafe_allow_html=True)
 t1, t2, t3, t4 = st.tabs(["🛒 Per sito", "📒 Produttori", "🌐 Siti", "💾 Dati"])
 allp = load_all()
 shops_df = q("SELECT id,name,country,url FROM shops ORDER BY name COLLATE NOCASE")
@@ -728,69 +830,184 @@ with t1:
             st.info("Nessun produttore con questi filtri.")
 
 # ── Produttori
-with t2:
-    mode = st.radio("Modalità", ["📋 Elenco", "➕ Nuovo"], horizontal=True, label_visibility="collapsed")
-    if mode.startswith("➕"):
+def filter_view(txt):
+    words = norm(txt).split()
+    return [p for p in allp if all(w in norm(" ".join([p["name"], p["country"], p["region"], p["subregion"], *p["sites"],
+                                                       *(f"{w2} {t} {g}" for t, g, w2 in p["styles"])])) for w in words)]
+
+
+def producer_detail(sel):
+    if sel == "new":
+        st.markdown("### ➕ Nuovo produttore")
         producer_form(None, allp, shops)
-    elif not allp:
-        st.info("Rubrica vuota.")
+        return
+    cur = next((p for p in allp if p["id"] == sel), None)
+    if cur is None:
+        st.info("Questo produttore non esiste più.")
+        return
+    st.markdown(detail_html(cur, {x["name"]: x for x in shops}), unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    if c1.button("✏️ Modifica", key=f"ed{sel}", use_container_width=True):
+        st.session_state.editing, st.session_state.confirm = sel, None
+    if c2.button("🗑️ Elimina", key=f"rm{sel}", use_container_width=True):
+        st.session_state.confirm, st.session_state.editing = sel, None
+    if st.session_state.confirm == sel:
+        st.warning(f"Eliminare «{cur['name']}»? L'operazione non si può annullare.")
+        y, n = st.columns(2)
+        if y.button("Sì, elimina", key=f"yes{sel}", type="primary", use_container_width=True):
+            delete_producer(sel)
+            go(None)
+            st.toast("Produttore eliminato 🗑️")
+            st.rerun()
+        if n.button("Annulla", key=f"no{sel}", use_container_width=True):
+            st.session_state.confirm = None
+            st.rerun()
+    if st.session_state.editing == sel:
+        producer_form(sel, allp, shops)
+        if st.button("✖ Chiudi modifica", key=f"cl{sel}"):
+            st.session_state.editing = None
+            st.rerun()
+
+
+def producers_list_phone():
+    if st.button("➕ Nuovo produttore", type="primary", use_container_width=True):
+        go("new")
+        st.rerun()
+    txt = st.text_input("Cerca", key="ps", placeholder="🔎 Produttore, regione, uva, sito…", label_visibility="collapsed")
+    if txt != st.session_state.last_txt:
+        st.session_state.last_txt, st.session_state.limit = txt, 40
+    view = filter_view(txt)
+    st.caption(f"{len(view)} produttori")
+    for p in view[:st.session_state.limit]:
+        label = f"{FLAGS.get(p['country'], '🍷')}  {p['name']}" + (f"  ·  {p['region']}" if p["region"] else "")
+        if st.button(label, key=f"prow{p['id']}", use_container_width=True):
+            go(p["id"])
+            st.rerun()
+    if len(view) > st.session_state.limit and st.button(f"Mostra altri ({len(view) - st.session_state.limit})", key="more", use_container_width=True):
+        st.session_state.limit += 40
+        st.rerun()
+
+
+def producers_list_pc():
+    if st.button("➕ Nuovo produttore", type="primary"):
+        go("new")
+        st.rerun()
+    txt = st.text_input("🔎 Cerca per produttore, regione, uva o sito", key="ps")
+    view = filter_view(txt)
+    st.caption(f"{len(view)} produttori · clicca una riga per aprirla")
+    if view:
+        table = pd.DataFrame({"Produttore": [p["name"] for p in view], "Zona": [flagged_zone(p) for p in view],
+                              "Siti": [", ".join(p["sites"]) for p in view]})
+        ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row",
+                          height=560, key=f"ptbl_{st.session_state.tv}_{txt.strip()}")
+        if ev.selection.rows:
+            pid = view[ev.selection.rows[0]]["id"]
+            if pid != st.session_state.last_tbl:
+                st.session_state.last_tbl, st.session_state.sel, st.session_state.editing, st.session_state.confirm = pid, pid, None, None
+
+
+with t2:
+    if not allp and st.session_state.sel != "new":
+        st.info("Rubrica vuota: aggiungi il primo produttore o importa il tuo foglio dalla scheda 💾 Dati.")
+        if st.button("➕ Aggiungi il primo produttore", type="primary"):
+            go("new")
+            st.rerun()
+    elif PHONE:
+        if st.session_state.sel is None:
+            producers_list_phone()
+        else:
+            if st.button("← Elenco", key="back"):
+                go(None)
+                st.rerun()
+            producer_detail(st.session_state.sel)
     else:
-        txt = st.text_input("🔎 Cerca per produttore, regione, uva o sito", key="ps")
-        words = norm(txt).split()
-        view = [p for p in allp if all(w in norm(" ".join([p["name"], p["country"], p["region"], p["subregion"], *p["sites"], *(f"{w} {t} {g}" for t, g, w in p["styles"])])) for w in words)]
-        st.caption(f"{len(view)} produttori · tocca una riga per aprire la scheda")
-        if view:
-            table = pd.DataFrame({"Produttore": [p["name"] for p in view],
-                                  "Zona": [flagged_zone(p) for p in view],
-                                  "Siti": [", ".join(p["sites"]) for p in view]})
-            ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row",
-                              key=f"ptbl_{st.session_state.tv}_{txt.strip()}")
-            pick_name = st.selectbox("…oppure scegli dall'elenco", [p["name"] for p in view], index=None, placeholder="Scegli un produttore",
-                                     key=f"psel_{st.session_state.tv}")
-            sel_rows = ev.selection.rows
-            cur = view[sel_rows[0]] if sel_rows else next((p for p in view if p["name"] == pick_name), None)
-            if cur:
-                st.divider()
-                st.markdown(f"### {cur['name']}")
-                producer_form(cur["id"], allp, shops)
-                if st.button("🗑️ Elimina produttore", key=f"rm{cur['id']}"):
-                    st.session_state.confirm = cur["id"]
-                if st.session_state.confirm == cur["id"]:
-                    st.warning(f"Eliminare «{cur['name']}»? L'operazione non si può annullare.")
-                    y, n = st.columns(2)
-                    if y.button("Sì, elimina", key=f"yes{cur['id']}", type="primary", use_container_width=True):
-                        delete_producer(cur["id"])
-                        st.session_state.confirm, st.session_state.tv = None, st.session_state.tv + 1
-                        st.toast("Produttore eliminato 🗑️")
-                        st.rerun()
-                    if n.button("Annulla", key=f"no{cur['id']}", use_container_width=True):
-                        st.session_state.confirm = None
-                        st.rerun()
+        left, right = st.columns([2, 3], gap="large")
+        with left:
+            producers_list_pc()
+        with right:
+            if st.session_state.sel is None:
+                st.info("Seleziona un produttore dall'elenco per vederne i vini e modificarlo.")
+            else:
+                producer_detail(st.session_state.sel)
 
 # ── Siti
-with t3:
-    st.caption("Per ogni sito: nome, paese e indirizzo di ricerca, con {q} al posto del testo cercato (es. https://sito.it/cerca?q={q}). "
-               "Serve per il pulsante «Cerca» sulle schede. Eliminare un sito toglie anche i suoi collegamenti ai produttori.")
-    ed = st.data_editor(shops_df.assign(country=shops_df["country"].fillna(""), url=shops_df["url"].fillna("")), num_rows="dynamic", hide_index=True,
-                        use_container_width=True, key="shops_ed",
-                        column_config={"id": None, "name": "Sito", "country": st.column_config.SelectboxColumn("Paese", options=KNOWN_COUNTRIES),
-                                       "url": "Indirizzo di ricerca"})
-    if st.button("💾 Salva siti", type="primary"):
-        keep = [int(i) for i in ed["id"].dropna()] or [-1]
-        with db() as c:
-            c.execute(f"DELETE FROM shops WHERE id NOT IN ({','.join('?' * len(keep))})", keep)
-            for _, r in ed.iterrows():
-                nm = _cl(r["name"])
+def shop_fields(sid, s0, prefix):
+    nm = st.text_input("Nome", s0["name"], key=f"{prefix}n{sid}")
+    cs = [""] + sorted(set(KNOWN_COUNTRIES) | ({s0["country"]} if s0["country"] else set()))
+    ct = st.selectbox("Paese", cs, index=cs.index(s0["country"]) if s0["country"] in cs else 0, key=f"{prefix}c{sid}")
+    url = st.text_input("Indirizzo di ricerca (con {q} al posto del testo cercato)", s0["url"], key=f"{prefix}u{sid}", placeholder="https://sito.it/cerca?q={q}")
+    return _cl(nm), ct, _cl(url)
+
+
+def shops_phone():
+    st.caption("Tocca un sito per modificarlo.")
+    for s0 in shops:
+        s0 = {**s0, "country": s0["country"] or "", "url": s0["url"] or ""}
+        n_p = sum(s0["name"] in p["sites"] for p in allp)
+        with st.expander(f"{s0['name']} · {n_p} produttori"):
+            nm, ct, url = shop_fields(s0["id"], s0, "sh")
+            if st.button("💾 Salva", key=f"shs{s0['id']}", type="primary", use_container_width=True):
                 if not nm:
-                    continue
-                vals = (nm, _cl(r["country"]), _cl(r["url"]))
-                if pd.notna(r["id"]):
-                    c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (*vals, int(r["id"])))
+                    st.error("Il nome non può essere vuoto.")
                 else:
-                    c.execute("INSERT OR IGNORE INTO shops(name,country,url) VALUES(?,?,?)", vals)
-        autosave()
-        st.toast("Siti salvati ✅")
-        st.rerun()
+                    try:
+                        save_shop(s0["id"], nm, ct, url)
+                        st.toast("Sito salvato ✅")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("Esiste già un sito con questo nome.")
+            if st.button("🗑️ Elimina sito", key=f"shd{s0['id']}", use_container_width=True):
+                st.session_state.confirm_shop = s0["id"]
+            if st.session_state.confirm_shop == s0["id"]:
+                st.warning(f"Eliminare «{s0['name']}»? Verranno tolti anche i suoi collegamenti ai produttori.")
+                if st.button("Sì, elimina", key=f"shy{s0['id']}", type="primary", use_container_width=True):
+                    delete_shop(s0["id"])
+                    st.session_state.confirm_shop = None
+                    st.rerun()
+                if st.button("Annulla", key=f"shno{s0['id']}", use_container_width=True):
+                    st.session_state.confirm_shop = None
+                    st.rerun()
+    with st.expander("➕ Nuovo sito"):
+        nm, ct, url = shop_fields("new", {"name": "", "country": "", "url": ""}, "sh")
+        if st.button("Aggiungi", key="shadd", type="primary", use_container_width=True):
+            if not nm:
+                st.error("Scrivi il nome del sito.")
+            else:
+                try:
+                    save_shop(None, nm, ct, url)
+                    st.toast("Sito aggiunto ✅")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Esiste già un sito con questo nome.")
+
+
+with t3:
+    if PHONE:
+        shops_phone()
+    else:
+        st.caption("Per ogni sito: nome, paese e indirizzo di ricerca, con {q} al posto del testo cercato (es. https://sito.it/cerca?q={q}). "
+                   "Serve per il pulsante «Cerca» sulle schede. Eliminare un sito toglie anche i suoi collegamenti ai produttori.")
+        ed = st.data_editor(shops_df.assign(country=shops_df["country"].fillna(""), url=shops_df["url"].fillna("")), num_rows="dynamic", hide_index=True,
+                            use_container_width=True, key="shops_ed",
+                            column_config={"id": None, "name": "Sito", "country": st.column_config.SelectboxColumn("Paese", options=KNOWN_COUNTRIES),
+                                           "url": "Indirizzo di ricerca"})
+        if st.button("💾 Salva siti", type="primary"):
+            keep = [int(i) for i in ed["id"].dropna()] or [-1]
+            with db() as c:
+                c.execute(f"DELETE FROM shops WHERE id NOT IN ({','.join('?' * len(keep))})", keep)
+                for _, r in ed.iterrows():
+                    nm = _cl(r["name"])
+                    if not nm:
+                        continue
+                    vals = (nm, _cl(r["country"]), _cl(r["url"]))
+                    if pd.notna(r["id"]):
+                        c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (*vals, int(r["id"])))
+                    else:
+                        c.execute("INSERT OR IGNORE INTO shops(name,country,url) VALUES(?,?,?)", vals)
+            autosave()
+            st.toast("Siti salvati ✅")
+            st.rerun()
+
 
 # ── Dati
 with t4:
