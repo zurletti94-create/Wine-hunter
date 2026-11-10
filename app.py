@@ -604,6 +604,27 @@ CSS_MORE = """<style>
 .wh-notes{font-size:.9rem;opacity:.85;white-space:pre-wrap}
 div[data-testid="stRadio"] [role="radiogroup"]{gap:.5rem}
 </style>"""
+CSS_THEME = """<style>
+:root{--card:rgba(255,255,255,.62)}
+.stApp{--bg:#F4EAD8;background:var(--bg)!important}
+[data-testid="stAppViewContainer"],[data-testid="stMain"],[data-testid="stHeader"]{background:transparent!important}
+.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(2)[aria-selected="true"]){--bg:#F0E1C8}
+.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(3)[aria-selected="true"]){--bg:#E6ECDC}
+.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(4)[aria-selected="true"]){--bg:#E9E0D6}
+.wh-card,.wh-detail{background:var(--card)}
+div[data-baseweb="select"]>div,div[data-baseweb="input"]>div,div[data-baseweb="textarea"]>div,div[data-testid="stExpander"]{background-color:rgba(255,255,255,.55)!important}
+[class*="st-key-newprod"] button{background:rgba(166,38,74,.09)!important;color:var(--wine)!important;border:1.5px solid rgba(166,38,74,.40)!important}
+[class*="st-key-newprod"] button:hover{background:rgba(166,38,74,.17)!important}
+@media (prefers-color-scheme: dark){
+:root{--card:rgba(255,255,255,.06)}
+.stApp{--bg:#2B241B}
+.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(2)[aria-selected="true"]){--bg:#2E2417}
+.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(3)[aria-selected="true"]){--bg:#1F2A22}
+.stApp:has(.stTabs [data-baseweb="tab"]:nth-of-type(4)[aria-selected="true"]){--bg:#272220}
+div[data-baseweb="select"]>div,div[data-baseweb="input"]>div,div[data-baseweb="textarea"]>div,div[data-testid="stExpander"]{background-color:rgba(255,255,255,.07)!important}
+[class*="st-key-newprod"] button{background:rgba(232,138,168,.12)!important;color:#F2B3C6!important;border-color:rgba(232,138,168,.45)!important}
+}
+</style>"""
 CSS_PHONE = """<style>
 html{-webkit-text-size-adjust:100%}
 .block-container{padding-top:3.2rem!important;padding-left:.7rem!important;padding-right:.7rem!important;padding-bottom:5rem!important}
@@ -789,7 +810,7 @@ if "vista" not in st.session_state:
 st.radio("Vista", _opts, horizontal=True, key="vista", label_visibility="collapsed")
 PHONE = st.session_state.vista == _opts[0]
 st.query_params["v"] = "tel" if PHONE else "pc"
-st.markdown(CSS + CSS_MORE + (CSS_PHONE if PHONE else CSS_PC), unsafe_allow_html=True)
+st.markdown(CSS + CSS_MORE + CSS_THEME + (CSS_PHONE if PHONE else CSS_PC), unsafe_allow_html=True)
 _n = lambda sql: int(q(sql).iloc[0, 0])
 st.markdown(hero_html(PHONE, _n("SELECT COUNT(*) FROM producers"), _n("SELECT COUNT(*) FROM shops"), _n("SELECT COUNT(*) FROM avail")),
             unsafe_allow_html=True)
@@ -870,7 +891,7 @@ def producer_detail(sel):
 
 
 def producers_list_phone():
-    if st.button("➕ Nuovo produttore", type="primary", use_container_width=True):
+    if st.button("➕ Nuovo produttore", key="newprod", use_container_width=True):
         go("new")
         st.rerun()
     txt = st.text_input("Cerca", key="ps", placeholder="🔎 Produttore, regione, uva, sito…", label_visibility="collapsed")
@@ -889,7 +910,7 @@ def producers_list_phone():
 
 
 def producers_list_pc():
-    if st.button("➕ Nuovo produttore", type="primary"):
+    if st.button("➕ Nuovo produttore", key="newprod_pc"):
         go("new")
         st.rerun()
     txt = st.text_input("🔎 Cerca per produttore, regione, uva o sito", key="ps")
@@ -909,7 +930,7 @@ def producers_list_pc():
 with t2:
     if not allp and st.session_state.sel != "new":
         st.info("Rubrica vuota: aggiungi il primo produttore o importa il tuo foglio dalla scheda 💾 Dati.")
-        if st.button("➕ Aggiungi il primo produttore", type="primary"):
+        if st.button("➕ Aggiungi il primo produttore", key="newprod_first"):
             go("new")
             st.rerun()
     elif PHONE:
