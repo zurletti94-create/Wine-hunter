@@ -605,15 +605,17 @@ CSS_MORE = """<style>
 div[data-testid="stRadio"] [role="radiogroup"]{gap:.5rem}
 </style>"""
 CSS_THEME = """<style>
-:root{--card:rgba(255,255,255,.66)}
+:root{--card:#FFFFFF}
 .stApp{background:#FBF5E8!important}
-[data-testid="stAppViewContainer"],[data-testid="stMain"],[data-testid="stHeader"]{background:transparent!important}
+[data-testid="stAppViewContainer"],[data-testid="stMain"]{background:transparent!important}
+[data-testid="stHeader"]{background:#FBF5E8!important}
 .wh-card,.wh-detail{background:var(--card)}
 [class*="st-key-newprod"] button{background:rgba(166,38,74,.09)!important;color:var(--wine)!important;border:1.5px solid rgba(166,38,74,.40)!important}
 [class*="st-key-newprod"] button:hover{background:rgba(166,38,74,.17)!important}
 @media (prefers-color-scheme: dark){
 :root{--card:rgba(255,255,255,.06)}
 .stApp{background:#2B241B!important}
+[data-testid="stHeader"]{background:#2B241B!important}
 [class*="st-key-newprod"] button{background:rgba(232,138,168,.12)!important;color:#F2B3C6!important;border-color:rgba(232,138,168,.45)!important}
 }
 </style>"""
