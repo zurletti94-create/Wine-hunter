@@ -8,7 +8,7 @@ import unicodedata
 from datetime import datetime
 from difflib import get_close_matches
 from html import escape
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
 import requests
@@ -842,6 +842,57 @@ def filter_view(txt):
                                                        *(f"{w2} {t} {g}" for t, g, w2 in p["styles"])])) for w in words)]
 
 
+def shop_domain(shop):
+    url = shop.get("url")
+    if isinstance(url, str) and url.startswith(("http://", "https://")):
+        return urlparse(url).netloc.removeprefix("www.")
+    return ""
+
+
+def search_targets(name, google):
+    """[(sito, indirizzo)] per cercare il produttore su tutti i siti: con Google (site:dominio) oppure con la ricerca interna del sito."""
+    out = []
+    for x in shops:
+        if google:
+            dom = shop_domain(x)
+            if dom:
+                query = f"site:{dom} {name}"
+            elif norm(x["name"]) != "produttore":  # senza indirizzo del sito, Google cerca il nome del produttore insieme al nome del sito
+                query = f"{name} {x['name']}"
+            else:
+                continue
+            out.append((x["name"], "https://www.google.com/search?q=" + quote_plus(query)))
+        elif isinstance(x["url"], str) and "{q}" in x["url"] and x["url"].startswith(("http://", "https://")):
+            out.append((x["name"], x["url"].replace("{q}", quote_plus(name))))
+    return out
+
+
+def search_all_button(cur):
+    """Pulsante «Cerca ovunque»: con un tocco apre una scheda del browser per ogni sito (se il browser lo consente)."""
+    google = st.toggle("🔍 Cerca con Google", value=True, key="engine_google",
+                       help="Acceso: Google cerca il produttore dentro ogni sito (funziona anche per i siti senza ricerca propria). Spento: usa la ricerca interna di ciascun sito.")
+    targets = search_targets(cur["name"], google)
+    if not targets:
+        st.caption("Nessun sito ha un indirizzo di ricerca: aggiungilo nella scheda 🌐 Siti o accendi «Cerca con Google».")
+        return
+    payload = json.dumps([u for _, u in targets]).replace("</", "<\\/")
+    st.components.v1.html(
+        "<style>html,body{margin:0;background:transparent}button{width:100%;height:48px;border:0;border-radius:14px;"
+        "background:linear-gradient(135deg,#7E1B38,#A6264A);color:#fff;font:600 16px system-ui,sans-serif;cursor:pointer}</style>"
+        f'<button id="go">🔎 Cerca ovunque · {len(targets)} siti</button>'
+        f"<script>const urls={payload};document.getElementById('go').addEventListener('click',()=>{{urls.forEach(u=>window.open(u,'_blank','noopener'));}});</script>",
+        height=56)
+    if google:
+        st.caption("Google cerca il nome dentro ogni sito: i risultati dipendono da quanto Google ha indicizzato quel sito.")
+    else:
+        st.caption(f"Ricerca interna dei siti: {len(targets)} su {len(shops)} hanno un indirizzo di ricerca. Gli altri puoi completarli nella scheda 🌐 Siti.")
+    st.caption("Se si apre una sola scheda, il browser blocca le altre: consenti i pop-up per questo sito oppure usa «Apri i siti uno per uno».")
+    with st.expander("Apri i siti uno per uno"):
+        st.markdown('<div class="wh-sites">' + "".join(
+            f'<a class="wh-btn" href="{escape(u, quote=True)}" target="_blank" rel="noopener noreferrer">{escape(n)} ↗</a>' for n, u in targets) + "</div>",
+            unsafe_allow_html=True)
+
+
 def producer_detail(sel):
     if sel == "new":
         st.markdown("### ➕ Nuovo produttore")
@@ -852,6 +903,7 @@ def producer_detail(sel):
         st.info("Questo produttore non esiste più.")
         return
     st.markdown(detail_html(cur, {x["name"]: x for x in shops}), unsafe_allow_html=True)
+    search_all_button(cur)
     c1, c2 = st.columns(2)
     if c1.button("✏️ Modifica", key=f"ed{sel}", use_container_width=True):
         st.session_state.editing, st.session_state.confirm = sel, None
