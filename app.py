@@ -376,7 +376,7 @@ def upsert_shop(name, country="", url=""):
                   (name, country or known[0], url or known[1]))
 
 
-# ───────────────────────── Importazione dal vecchio foglio Excel ─────────────────────────
+# ───────────────────────── Importazione dal vecchio foglio Excel (non più usata nell'interfaccia) ─────────────────────────
 def _cl(x):
     return "" if x is None or (isinstance(x, float) and pd.isna(x)) else " ".join(str(x).split())
 
@@ -605,15 +605,19 @@ CSS_MORE = """<style>
 div[data-testid="stRadio"] [role="radiogroup"]{gap:.5rem}
 </style>"""
 CSS_THEME = """<style>
-:root{--card:#FFFFFF}
-html,body,.stApp,[data-testid="stApp"],[data-testid="stAppViewContainer"],[data-testid="stMain"],section.main,.main,[data-testid="stMainBlockContainer"],.block-container,[data-testid="stHeader"]{background:#FBF5E8!important}
-.wh-card,.wh-detail{background:var(--card)}
+.wh-card,.wh-detail{background:#FFFFFF;color:#31333F}
 [class*="st-key-newprod"] button{background:rgba(166,38,74,.09)!important;color:var(--wine)!important;border:1.5px solid rgba(166,38,74,.40)!important}
 [class*="st-key-newprod"] button:hover{background:rgba(166,38,74,.17)!important}
-@media (prefers-color-scheme: dark){
-:root{--card:rgba(255,255,255,.06)}
-html,body,.stApp,[data-testid="stApp"],[data-testid="stAppViewContainer"],[data-testid="stMain"],section.main,.main,[data-testid="stMainBlockContainer"],.block-container,[data-testid="stHeader"]{background:#2B241B!important}
-[class*="st-key-newprod"] button{background:rgba(232,138,168,.12)!important;color:#F2B3C6!important;border-color:rgba(232,138,168,.45)!important}
+@media (prefers-color-scheme: light){
+html{background:#FBF5E8!important}
+body{background:#FBF5E8!important}
+.stApp{background:#FBF5E8!important}
+[data-testid="stApp"]{background:#FBF5E8!important}
+[data-testid="stAppViewContainer"]{background:#FBF5E8!important}
+[data-testid="stMain"]{background:#FBF5E8!important}
+[data-testid="stMainBlockContainer"]{background:#FBF5E8!important}
+.block-container{background:#FBF5E8!important}
+[data-testid="stHeader"]{background:#FBF5E8!important}
 }
 </style>"""
 CSS_PHONE = """<style>
@@ -1025,45 +1029,24 @@ with t3:
 # ── Dati
 with t4:
     if gh_conf():
-        st.success("☁️ Salvataggio automatico su GitHub attivo: i dati sopravvivono ai riavvii dell'app.")
+        st.success("☁️ Salvataggio automatico attivo: ogni modifica viene salvata da sola su GitHub e i dati sopravvivono ai riavvii dell'app.")
     else:
         st.warning("Salvataggio automatico non configurato: i dati si azzerano a ogni riavvio. Aggiungi GITHUB_TOKEN e GITHUB_REPO nei Secrets.")
-    st.subheader("📥 Importa il tuo foglio Excel")
-    st.caption("Carica il file con le colonne Paese, Regione, Produttore, Tipo 1/Uva 1…, Sito 1…. I produttori già presenti vengono uniti senza togliere nulla.")
-    up = st.file_uploader("File .xlsx", type=["xlsx"], key="xl")
-    if up:
-        try:
-            rows, new_shops, fixes = read_old_xlsx(up.getvalue())
-        except Exception as e:
-            rows, new_shops, fixes = None, None, [f"Non riesco a leggere il file: {e}"]
-        if rows is None:
-            st.error(fixes[0])
-        else:
-            known = {pkey(p["name"]) for p in allp}
-            st.caption(f"{len(rows)} produttori ({sum(pkey(r['name']) not in known for r in rows)} nuovi) · {len(new_shops)} siti")
-            if fixes:
-                st.info("Correzioni automatiche: " + "; ".join(fixes))
-            st.dataframe(pd.DataFrame([{"Produttore": r["name"], "Paese": r["country"], "Regione": r["region"], "Sotto-regione": r["subregion"],
-                                        "Tipi e uve": styles_text(r), "Siti": ", ".join(r["sites"]),
-                                        "Stato": "già presente (unito)" if pkey(r["name"]) in known else "nuovo"} for r in rows]),
-                         hide_index=True, use_container_width=True)
-            if st.button("📥 Importa", type="primary"):
-                a, m = import_rows(rows, new_shops)
-                autosave()
-                st.session_state.tv += 1
-                st.toast(f"Importati: {a} produttori nuovi, {m} uniti ✅")
-                st.rerun()
-    st.divider()
-    st.subheader("📤 Esporta")
+    st.subheader("📤 Copie dei tuoi dati")
+    st.markdown("**Excel** · un foglio simile a quello da cui sei partito (Paese, Regione, Sottoregione, Produttore, Tipo/Uva/Vino, Siti, Note). "
+                "Serve per leggere o stampare i dati, o per riaprirli in Excel e Fogli Google. All'app non serve.")
     buf = io.BytesIO()
-    exp = export_df()
-    exp.to_excel(buf, index=False, sheet_name="Produttori")
-    st.download_button("⬇️ Scarica Excel", buf.getvalue(), "cantina.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.download_button("⬇️ Scarica backup completo (JSON)", json.dumps(dump(), ensure_ascii=False, default=str), "cantina_backup.json", "application/json")
-    bk = st.file_uploader("Ripristina da backup JSON", type="json", key="bk")
-    if bk and st.button("♻️ Ripristina (sovrascrive tutto)"):
-        restore(json.load(bk))
-        autosave()
-        st.rerun()
-    if gh_conf() and st.button("Salva ora su GitHub"):
-        st.success("Salvato.") if push_backup() else st.error("Salvataggio non riuscito: controlla GITHUB_TOKEN e GITHUB_REPO.")
+    export_df().to_excel(buf, index=False, sheet_name="Produttori")
+    st.download_button("⬇️ Scarica Excel", buf.getvalue(), "cantina.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       use_container_width=True)
+    st.markdown("**Copia di sicurezza** · tutti i dati nel formato dell'app, utile solo per un ripristino. "
+                "Con il salvataggio automatico attivo è una seconda copia in più: scaricala ogni tanto.")
+    st.download_button("⬇️ Scarica copia di sicurezza (JSON)", json.dumps(dump(), ensure_ascii=False, default=str), "cantina_backup.json",
+                       "application/json", use_container_width=True)
+    with st.expander("♻️ Ripristino da copia di sicurezza (solo emergenze)"):
+        st.caption("Carica un file JSON scaricato qui sopra: sostituisce tutti i dati attuali.")
+        bk = st.file_uploader("File JSON", type="json", key="bk")
+        if bk and st.button("♻️ Ripristina (sovrascrive tutto)", use_container_width=True):
+            restore(json.load(bk))
+            autosave()
+            st.rerun()
