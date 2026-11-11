@@ -291,7 +291,7 @@ def push_backup():
 
 def autosave():
     if push_backup() is False:
-        st.toast("⚠️ Salvataggio su GitHub non riuscito: scarica un backup dalla scheda Dati.")
+        st.toast("⚠️ Salvataggio su GitHub non riuscito: al riavvio i dati potrebbero andare persi. Controlla GITHUB_TOKEN e GITHUB_REPO nei Secrets.")
 
 
 @st.cache_resource
@@ -521,7 +521,7 @@ def pcard(p, shop):
     stripe = next((type_class(t) for t, _, _ in p["styles"] if type_class(t)), "none")
     others = [x for x in p["sites"] if not shop or x != shop["name"]]
     also = f'<span class="wh-also">Anche su: {escape(", ".join(others))}</span>' if others else '<span class="wh-also"></span>'
-    return (f'<div class="wh-card s-{stripe}"><div class="wh-name">{escape(p["name"])}</div><div class="wh-zone">{escape(zone)}</div>'
+    return (f'<div class="wh-card s-{stripe}" style="background:#FFFFFF;color:#31333F"><div class="wh-name">{escape(p["name"])}</div><div class="wh-zone">{escape(zone)}</div>'
             f'<div class="wh-tags">{chips}</div><div class="wh-foot">{also}{shop_link(shop, p["name"])}</div></div>')
 
 
@@ -608,17 +608,6 @@ CSS_THEME = """<style>
 .wh-card,.wh-detail{background:#FFFFFF;color:#31333F}
 [class*="st-key-newprod"] button{background:rgba(166,38,74,.09)!important;color:var(--wine)!important;border:1.5px solid rgba(166,38,74,.40)!important}
 [class*="st-key-newprod"] button:hover{background:rgba(166,38,74,.17)!important}
-@media (prefers-color-scheme: light){
-html{background:#FBF5E8!important}
-body{background:#FBF5E8!important}
-.stApp{background:#FBF5E8!important}
-[data-testid="stApp"]{background:#FBF5E8!important}
-[data-testid="stAppViewContainer"]{background:#FBF5E8!important}
-[data-testid="stMain"]{background:#FBF5E8!important}
-[data-testid="stMainBlockContainer"]{background:#FBF5E8!important}
-.block-container{background:#FBF5E8!important}
-[data-testid="stHeader"]{background:#FBF5E8!important}
-}
 </style>"""
 CSS_PHONE = """<style>
 html{-webkit-text-size-adjust:100%}
@@ -680,7 +669,7 @@ def detail_html(p, shop_map):
         + (f'<span class="chip t-{type_class(t)}">{escape(t)}{" · " + escape(g) if t and g else escape(g)}</span>' if t or g else "") + "</div>"
         for t, g, w in p["styles"] if t or g or w)
     sites = "".join(shop_pill(x, shop_map.get(x), p["name"]) for x in p["sites"])
-    return (f'<div class="wh-detail"><div class="wh-name">{escape(p["name"])}</div><div class="wh-zone">{escape(flagged_zone(p) or "Zona non indicata")}</div>'
+    return (f'<div class="wh-detail" style="background:#FFFFFF;color:#31333F"><div class="wh-name">{escape(p["name"])}</div><div class="wh-zone">{escape(flagged_zone(p) or "Zona non indicata")}</div>'
             + (f'<div class="wh-sec">Vini</div>{lines}' if lines else "")
             + (f'<div class="wh-sec">Dove trovarli</div><div class="wh-sites">{sites}</div>' if sites else "")
             + (f'<div class="wh-sec">Note</div><div class="wh-notes">{escape(p["notes"])}</div>' if p["notes"] else "") + "</div>")
@@ -810,7 +799,7 @@ st.markdown(CSS + CSS_MORE + CSS_THEME + (CSS_PHONE if PHONE else CSS_PC), unsaf
 _n = lambda sql: int(q(sql).iloc[0, 0])
 st.markdown(hero_html(PHONE, _n("SELECT COUNT(*) FROM producers"), _n("SELECT COUNT(*) FROM shops"), _n("SELECT COUNT(*) FROM avail")),
             unsafe_allow_html=True)
-t1, t2, t3, t4 = st.tabs(["🛒 Per sito", "📒 Produttori", "🌐 Siti", "💾 Dati"])
+t1, t2, t3 = st.tabs(["🛒 Per sito", "📒 Produttori", "🌐 Siti"])
 allp = load_all()
 shops_df = q("SELECT id,name,country,url FROM shops ORDER BY name COLLATE NOCASE")
 shops = shops_df.to_dict("records")
@@ -818,7 +807,7 @@ shops = shops_df.to_dict("records")
 # ── Per sito
 with t1:
     if not allp:
-        st.info("Nessun produttore: importa il tuo foglio dalla scheda 💾 Dati o aggiungili dalla scheda 📒 Produttori.")
+        st.info("Nessun produttore: aggiungili dalla scheda 📒 Produttori.")
     else:
         NONE = "— senza sito assegnato —"
         counts = {s["name"]: sum(s["name"] in p["sites"] for p in allp) for s in shops}
@@ -925,7 +914,7 @@ def producers_list_pc():
 
 with t2:
     if not allp and st.session_state.sel != "new":
-        st.info("Rubrica vuota: aggiungi il primo produttore o importa il tuo foglio dalla scheda 💾 Dati.")
+        st.info("Rubrica vuota: aggiungi il primo produttore.")
         if st.button("➕ Aggiungi il primo produttore", key="newprod_first"):
             go("new")
             st.rerun()
@@ -1023,30 +1012,4 @@ with t3:
                         c.execute("INSERT OR IGNORE INTO shops(name,country,url) VALUES(?,?,?)", vals)
             autosave()
             st.toast("Siti salvati ✅")
-            st.rerun()
-
-
-# ── Dati
-with t4:
-    if gh_conf():
-        st.success("☁️ Salvataggio automatico attivo: ogni modifica viene salvata da sola su GitHub e i dati sopravvivono ai riavvii dell'app.")
-    else:
-        st.warning("Salvataggio automatico non configurato: i dati si azzerano a ogni riavvio. Aggiungi GITHUB_TOKEN e GITHUB_REPO nei Secrets.")
-    st.subheader("📤 Copie dei tuoi dati")
-    st.markdown("**Excel** · un foglio simile a quello da cui sei partito (Paese, Regione, Sottoregione, Produttore, Tipo/Uva/Vino, Siti, Note). "
-                "Serve per leggere o stampare i dati, o per riaprirli in Excel e Fogli Google. All'app non serve.")
-    buf = io.BytesIO()
-    export_df().to_excel(buf, index=False, sheet_name="Produttori")
-    st.download_button("⬇️ Scarica Excel", buf.getvalue(), "cantina.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       use_container_width=True)
-    st.markdown("**Copia di sicurezza** · tutti i dati nel formato dell'app, utile solo per un ripristino. "
-                "Con il salvataggio automatico attivo è una seconda copia in più: scaricala ogni tanto.")
-    st.download_button("⬇️ Scarica copia di sicurezza (JSON)", json.dumps(dump(), ensure_ascii=False, default=str), "cantina_backup.json",
-                       "application/json", use_container_width=True)
-    with st.expander("♻️ Ripristino da copia di sicurezza (solo emergenze)"):
-        st.caption("Carica un file JSON scaricato qui sopra: sostituisce tutti i dati attuali.")
-        bk = st.file_uploader("File JSON", type="json", key="bk")
-        if bk and st.button("♻️ Ripristina (sovrascrive tutto)", use_container_width=True):
-            restore(json.load(bk))
-            autosave()
             st.rerun()
