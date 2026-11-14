@@ -693,6 +693,7 @@ def save_shop(sid, name, country, url):
 
 def delete_shop(sid):
     with db() as c:
+        c.execute("DELETE FROM avail WHERE shop_id=?", (int(sid),))
         c.execute("DELETE FROM shops WHERE id=?", (int(sid),))
     autosave()
 
@@ -1088,10 +1089,24 @@ with t3:
                 if st.button("✏️ Modifica", key=f"edit_shop_{sid}"):
                     st.session_state[f"editing_shop_{sid}"] = not st.session_state.get(f"editing_shop_{sid}", False)
             with c3:
-                if st.button("🗑️ Elimina", key=f"del_shop_{sid}", type="secondary"):
-                    delete_shop(sid)
-                    st.toast(f"Sito '{sname}' eliminato 🗑️")
-                    st.rerun()
+                confirm_key = f"confirm_del_shop_{sid}"
+                if not st.session_state.get(confirm_key, False):
+                    if st.button("🗑️ Elimina", key=f"del_shop_{sid}", type="secondary"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    st.warning("Confermi?")
+                    col_y, col_n = st.columns(2)
+                    with col_y:
+                        if st.button("Sì", key=f"yes_shop_{sid}", type="primary"):
+                            delete_shop(sid)
+                            st.session_state[confirm_key] = False
+                            st.toast(f"Sito eliminato 🗑️")
+                            st.rerun()
+                    with col_n:
+                        if st.button("No", key=f"no_shop_{sid}"):
+                            st.session_state[confirm_key] = False
+                            st.rerun()
 
             # Se l'utente clicca Modifica, apre i campi di input per quel singolo sito
             if st.session_state.get(f"editing_shop_{sid}", False):
