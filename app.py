@@ -69,8 +69,9 @@ def init():
         for table, col in (("producers", "subregion"), ("styles", "wine")):
             if col not in [r[1] for r in c.execute(f"PRAGMA table_info({table})")]:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
-        # Inserisce i siti di default solo se non già presenti
-        c.executemany("INSERT OR IGNORE INTO shops(name, country, url) VALUES(?, ?, ?)", DEFAULT_SHOPS)
+        # Inserisce i siti di default solo se la tabella shops è completamente vuota
+        if c.execute("SELECT COUNT(*) FROM shops").fetchone()[0] == 0:
+            c.executemany("INSERT OR IGNORE INTO shops(name, country, url) VALUES(?, ?, ?)", DEFAULT_SHOPS)
 
 
 def secret(k, d=None):
@@ -692,10 +693,15 @@ def save_shop(sid, name, country, url):
 
 
 def delete_shop(sid):
-    with db() as c:
-        c.execute("DELETE FROM avail WHERE shop_id=?", (int(sid),))
-        c.execute("DELETE FROM shops WHERE id=?", (int(sid),))
+    con = sqlite3.connect(DB)
+    con.execute("PRAGMA foreign_keys=ON")
+    cur = con.cursor()
+    cur.execute("DELETE FROM avail WHERE shop_id = ?", (int(sid),))
+    cur.execute("DELETE FROM shops WHERE id = ?", (int(sid),))
+    con.commit()
+    con.close()
     autosave()
+    st.cache_data.clear()
 
 
 def go(sel=None):
@@ -1068,14 +1074,14 @@ with t3:
 
     st.markdown("---")
 
-    # Elenco interattivo con pulsante Elimina e Test per ogni riga
-    for s0 in shops:
+    # Ricarica i siti aggiornati per riflettere subito le eliminazioni
+    current_shops = q("SELECT id,name,country,url FROM shops ORDER BY name COLLATE NOCASE").to_dict("records")
+
+    for s0 in current_shops:
         sid, sname, scountry, surl = s0["id"], s0["name"] or "", s0["country"] or "", s0["url"] or ""
         n_p = sum(sname in p["sites"] for p in allp)
         
         with st.container():
-            cols = [3, 2, 5, 2, 2] if not PHONE else [6, 4]
-            # Riga info principale
             st.markdown(f"**{sname}** ({scountry or 'Paese non specificato'}) · *{n_p} produttori collegati*")
             
             c1, c2, c3 = st.columns([3, 2, 2])
@@ -1091,29 +1097,28 @@ with t3:
             with c3:
                 confirm_key = f"confirm_del_shop_{sid}"
                 if not st.session_state.get(confirm_key, False):
-                    if st.button("🗑️ Elimina", key=f"del_shop_{sid}", type="secondary"):
+                    if st.button("🗑️ Elimina", key=f"del_shop_{sid}_{sid}", type="secondary"):
                         st.session_state[confirm_key] = True
                         st.rerun()
                 else:
                     st.warning("Confermi?")
                     col_y, col_n = st.columns(2)
                     with col_y:
-                        if st.button("Sì", key=f"yes_shop_{sid}", type="primary"):
+                        if st.button("Sì", key=f"yes_shop_{sid}_{sid}", type="primary"):
                             delete_shop(sid)
                             st.session_state[confirm_key] = False
                             st.toast(f"Sito eliminato 🗑️")
                             st.rerun()
                     with col_n:
-                        if st.button("No", key=f"no_shop_{sid}"):
+                        if st.button("No", key=f"no_shop_{sid}_{sid}"):
                             st.session_state[confirm_key] = False
                             st.rerun()
 
-            # Se l'utente clicca Modifica, apre i campi di input per quel singolo sito
             if st.session_state.get(f"editing_shop_{sid}", False):
                 with st.form(key=f"form_edit_{sid}"):
                     new_name = st.text_input("Nome", value=sname)
-                    new_country = st.selectbox("Paese", [scountry] + [c for c in KNOWN_COUNTRIES if c != scountry], index=0)
-                    new_url = st.text_input("Indirizzo di ricerca", value=surl)
+                    new_country = st.selectbox("Paese", [scountry] + [c for c in KNOWN_COUNTRIES if c != scountry], index=0, key=f"country_edit_{sid}")
+                    new_url = st.text_input("Indirizzo di ricerca", value=surl, key=f"url_edit_{sid}")
                     if st.form_submit_button("Salva modifiche", type="primary"):
                         with db() as c:
                             c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (_cl(new_name), new_country, _cl(new_url), sid))
