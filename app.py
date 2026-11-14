@@ -21,16 +21,21 @@ BASE_TYPES = ["Bianco", "Rosso", "Rosato", "Bolla", "Arancione", "Dolce"]
 STOP = {"domaine", "chateau", "maison", "tenuta", "cantina", "azienda", "agricola", "weingut", "bodega", "bodegas", "fattoria",
         "podere", "castello", "marchesi", "famiglia", "vini", "winery", "estate", "des", "les", "del", "della", "dei", "von"}
 # Siti che conosco già: (paese, indirizzo di ricerca con {q}). Gli altri li completi nella scheda Siti.
-KNOWN_SHOPS = {
-    "vinossimo": ("Francia", "https://vinossimo.com/recherche?controller=search&s={q}"),
-    "versus": ("", "https://www.versus.wine/catalogue?searchQuery={q}"),
-    "caves carrier": ("Francia", "https://www.caves-carriere.fr/recherche?s={q}"),
-    "buveur de vin": ("Francia", "https://buveurdevin.com/?s={q}&post_type=product"),
-    "wine rl": ("Austria", "https://www.winerl.com/en/#8b1f/mobile/m=and&q={q}"),
-    "weinfurore": ("Germania", "https://www.weinfurore.de/?qs={q}"),
-    "kierdorfwein": ("Germania", "https://www.kierdorfwein.de/search?keywords={q}&page=search&page_action=query"),
-    "restaurant cave la pepiniere": ("Francia", "https://restaurant-cave-lapepiniere.com/search?q={q}&type=product"),
-}
+DEFAULT_SHOPS = [
+    ("3K Wine", "Italia", "https://3kwine.com/?show_omnisearch=true&clerk_query={q}"),
+    ("Buveur de Vin", "Francia", "https://buveurdevin.com/?s={q}&post_type=product"),
+    ("Caves Carrier", "Francia", "https://www.caves-carriere.fr/recherche?s={q}"),
+    ("Clos de Millesimes", "Francia", "https://www.closdesmillesimes.com/"),
+    ("Decantalo", "Italia", "https://www.decantalo.it/it/"),
+    ("Kierdorfwein", "Germania", "https://www.kierdorfwein.de/search?keywords={q}&page=search&page_action=query"),
+    ("Produttore", "", ""),
+    ("Restaurant Cave La Pepiniere", "Francia", "https://restaurant-cave-lapepiniere.com/search?q={q}&type=product"),
+    ("Versus", "Francia", "https://www.versus.wine/catalogue?searchQuery={q}"),
+    ("Vinossimo", "Francia", "https://vinossimo.com/recherche?controller=search&s={q}"),
+    ("Wine RL", "Austria", "https://www.winerl.com/en/#8b1f/mobile/m=and&q={q}"),
+    ("Weinfurore", "Germania", "https://www.weinfurore.de/?qs={q}"),
+]
+KNOWN_SHOPS = {name.lower(): (country, url) for name, country, url in DEFAULT_SHOPS}
 
 
 # ───────────────────────── Database ─────────────────────────
@@ -61,9 +66,11 @@ def init():
         CREATE TABLE IF NOT EXISTS avail(producer_id INTEGER REFERENCES producers(id) ON DELETE CASCADE,
                                          shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE, PRIMARY KEY(producer_id, shop_id));
         """)
-        for table, col in (("producers", "subregion"), ("styles", "wine")):  # database creati con la versione precedente
+        for table, col in (("producers", "subregion"), ("styles", "wine")):
             if col not in [r[1] for r in c.execute(f"PRAGMA table_info({table})")]:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+        # Inserisce i siti di default solo se non già presenti
+        c.executemany("INSERT OR IGNORE INTO shops(name, country, url) VALUES(?, ?, ?)", DEFAULT_SHOPS)
 
 
 def secret(k, d=None):
@@ -1040,28 +1047,63 @@ def shops_phone():
 
 
 with t3:
-    if PHONE:
-        shops_phone()
-    else:
-        st.caption("Per ogni sito: nome, paese e indirizzo di ricerca, con {q} al posto del testo cercato (es. https://sito.it/cerca?q={q}). "
-                   "Serve per il pulsante «Cerca» sulle schede. Eliminare un sito toglie anche i suoi collegamenti ai produttori.")
-        ed = st.data_editor(shops_df.assign(country=shops_df["country"].fillna(""), url=shops_df["url"].fillna("")), num_rows="dynamic", hide_index=True,
-                            use_container_width=True, key="shops_ed",
-                            column_config={"id": None, "name": "Sito", "country": st.column_config.SelectboxColumn("Paese", options=KNOWN_COUNTRIES),
-                                           "url": "Indirizzo di ricerca"})
-        if st.button("💾 Salva siti", type="primary"):
-            keep = [int(i) for i in ed["id"].dropna()] or [-1]
-            with db() as c:
-                c.execute(f"DELETE FROM shops WHERE id NOT IN ({','.join('?' * len(keep))})", keep)
-                for _, r in ed.iterrows():
-                    nm = _cl(r["name"])
-                    if not nm:
-                        continue
-                    vals = (nm, _cl(r["country"]), _cl(r["url"]))
-                    if pd.notna(r["id"]):
-                        c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (*vals, int(r["id"])))
-                    else:
-                        c.execute("INSERT OR IGNORE INTO shops(name,country,url) VALUES(?,?,?)", vals)
-            autosave()
-            st.toast("Siti salvati ✅")
-            st.rerun()
+    st.caption("Gestisci i siti di e-commerce e verifica il corretto funzionamento dei link di ricerca.")
+    
+    # Form per aggiungere un nuovo sito in alto
+    with st.expander("➕ Aggiungi nuovo sito"):
+        nm_new = st.text_input("Nome sito", key="new_shop_name")
+        ct_new = st.selectbox("Paese", [""] + KNOWN_COUNTRIES, key="new_shop_country")
+        url_new = st.text_input("Indirizzo di ricerca (usa {q} per la query)", placeholder="https://sito.it/cerca?q={q}", key="new_shop_url")
+        if st.button("Salva nuovo sito", type="primary", key="new_shop_btn"):
+            if not nm_new.strip():
+                st.error("Inserisci il nome del sito.")
+            else:
+                try:
+                    save_shop(None, _cl(nm_new), ct_new, _cl(url_new))
+                    st.toast("Sito aggiunto ✅")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Esiste già un sito con questo nome.")
+
+    st.markdown("---")
+
+    # Elenco interattivo con pulsante Elimina e Test per ogni riga
+    for s0 in shops:
+        sid, sname, scountry, surl = s0["id"], s0["name"] or "", s0["country"] or "", s0["url"] or ""
+        n_p = sum(sname in p["sites"] for p in allp)
+        
+        with st.container():
+            cols = [3, 2, 5, 2, 2] if not PHONE else [6, 4]
+            # Riga info principale
+            st.markdown(f"**{sname}** ({scountry or 'Paese non specificato'}) · *{n_p} produttori collegati*")
+            
+            c1, c2, c3 = st.columns([3, 2, 2])
+            with c1:
+                test_link = surl.replace("{q}", "barolo") if "{q}" in surl else surl
+                if test_link.startswith(("http://", "https://")):
+                    st.markdown(f'<a class="wh-btn" href="{escape(test_link, quote=True)}" target="_blank" rel="noopener noreferrer">Testa link ↗</a>', unsafe_allow_html=True)
+                else:
+                    st.caption("URL non valido")
+            with c2:
+                if st.button("✏️ Modifica", key=f"edit_shop_{sid}"):
+                    st.session_state[f"editing_shop_{sid}"] = not st.session_state.get(f"editing_shop_{sid}", False)
+            with c3:
+                if st.button("🗑️ Elimina", key=f"del_shop_{sid}", type="secondary"):
+                    delete_shop(sid)
+                    st.toast(f"Sito '{sname}' eliminato 🗑️")
+                    st.rerun()
+
+            # Se l'utente clicca Modifica, apre i campi di input per quel singolo sito
+            if st.session_state.get(f"editing_shop_{sid}", False):
+                with st.form(key=f"form_edit_{sid}"):
+                    new_name = st.text_input("Nome", value=sname)
+                    new_country = st.selectbox("Paese", [scountry] + [c for c in KNOWN_COUNTRIES if c != scountry], index=0)
+                    new_url = st.text_input("Indirizzo di ricerca", value=surl)
+                    if st.form_submit_button("Salva modifiche", type="primary"):
+                        with db() as c:
+                            c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (_cl(new_name), new_country, _cl(new_url), sid))
+                        autosave()
+                        st.session_state[f"editing_shop_{sid}"] = False
+                        st.toast("Modifiche salvate ✅")
+                        st.rerun()
+            st.divider()
