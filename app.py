@@ -807,8 +807,8 @@ for _k, _v in (("fv", 0), ("tv", 0), ("confirm", None), ("ov", None), ("sug", No
 _opts = ["📱 Telefono", "💻 Computer"]
 if "vista" not in st.session_state:
     st.session_state.vista = _opts[1] if (st.query_params.get("v") or device_default()) == "pc" else _opts[0]
-st.radio("Vista", _opts, horizontal=True, key="vista", label_visibility="collapsed")
-PHONE = st.session_state.vista == _opts[0]
+st.segmented_control("Vista", _opts, key="vista", label_visibility="collapsed")  # pulsanti affiancati
+PHONE = st.session_state.get("vista") != _opts[1]  # se deselezionato → telefono
 st.query_params["v"] = "tel" if PHONE else "pc"
 st.markdown(CSS + CSS_MORE + CSS_THEME + (CSS_PHONE if PHONE else CSS_PC), unsafe_allow_html=True)
 _n = lambda sql: int(q(sql).iloc[0, 0])
@@ -1145,7 +1145,7 @@ def shops_pc():
                         st.session_state[f"editing_shop_{sid}"] = False
                         st.toast("Modifiche salvate ✅")
                         st.rerun()
-                        
+
 with t3:
     if PHONE:
         shops_phone()  # schede a espansione, pulsanti larghi
