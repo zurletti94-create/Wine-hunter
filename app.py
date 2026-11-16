@@ -1120,10 +1120,9 @@ with t3:
                     new_country = st.selectbox("Paese", [scountry] + [c for c in KNOWN_COUNTRIES if c != scountry], index=0, key=f"country_edit_{sid}")
                     new_url = st.text_input("Indirizzo di ricerca", value=surl, key=f"url_edit_{sid}")
                     if st.form_submit_button("Salva modifiche", type="primary"):
-                        with db() as c:
-                            c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (_cl(new_name), new_country, _cl(new_url), sid))
-                        autosave()
-                        st.session_state[f"editing_shop_{sid}"] = False
-                        st.toast("Modifiche salvate ✅")
-                        st.rerun()
+                        with db() as c:  # UPDATE può violare UNIQUE(name)
+                         c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (_cl(new_name), new_country, _cl(new_url), sid))
+                         except sqlite3.IntegrityError:
+                         st.error("Esiste già un sito con questo nome.")
+                         st.stop()
             st.divider()
