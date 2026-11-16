@@ -642,6 +642,7 @@ CSS_PC = """<style>
 .wh-hero{padding:1.3rem 1.6rem}
 .wh-hero h1{font-size:2.3rem!important}
 .wh-hero p{font-size:1rem}
+[data-testid="stColumn"]:first-child:has([data-testid="stRadio"]){position:sticky;top:3.5rem;align-self:flex-start;max-height:85vh;overflow-y:auto}
 </style>"""
 
 
@@ -819,6 +820,20 @@ shops_df = q("SELECT id,name,country,url FROM shops ORDER BY name COLLATE NOCASE
 shops = shops_df.to_dict("records")
 
 # ── Per sito
+def site_filters(items, box):
+    """Filtri nel contenitore indicato (expander su telefono, colonna laterale su PC)."""
+    with box:
+        txt = st.text_input("Cerca produttore")
+        f_c = st.multiselect("Paese", sorted({p["country"] for p in items if p["country"]}))
+        f_r = st.multiselect("Regione", sorted({p["region"] for p in items if p["region"]}))
+        f_s = st.multiselect("Provincia / sotto-regione", sorted({p["subregion"] for p in items if p["subregion"]}))
+        f_t = st.multiselect("Tipo", sorted({t for p in items for t, _, _ in p["styles"] if t}))
+        f_u = st.multiselect("Uva", sorted({g for p in items for _, g, _ in p["styles"] if g}))
+    return [p for p in items if (not txt or norm(txt) in norm(p["name"])) and (not f_c or p["country"] in f_c)
+            and (not f_r or p["region"] in f_r) and (not f_s or p["subregion"] in f_s)
+            and (not f_t or any(t in f_t for t, _, _ in p["styles"])) and (not f_u or any(g in f_u for _, g, _ in p["styles"]))]
+
+
 with t1:
     if not allp:
         st.info("Nessun produttore: aggiungili dalla scheda 📒 Produttori.")
@@ -827,27 +842,27 @@ with t1:
         counts = {s["name"]: sum(s["name"] in p["sites"] for p in allp) for s in shops}
         options = sorted(counts, key=lambda n: (-counts[n], n.lower())) + [NONE]
         counts[NONE] = sum(not p["sites"] for p in allp)
-        sel = st.selectbox("🛒 Dove vuoi comprare?", options, format_func=lambda n: f"{n} ({counts[n]})")
+        fmt = lambda n: f"{n} ({counts[n]})"
+        if PHONE:  # telefono: tutto in colonna, filtri richiudibili
+            side = main = st.container()
+            sel = st.selectbox("🛒 Dove vuoi comprare?", options, format_func=fmt)
+            fbox = st.expander("🎛️ Filtri")
+        else:  # PC: elenco siti + filtri a sinistra, schede a destra
+            side, main = st.columns([1, 3], gap="large")
+            sel = side.radio("🛒 Dove vuoi comprare?", options, format_func=fmt, key="pc_shop")
+            fbox = side.container()
         shop = next((s for s in shops if s["name"] == sel), None)
         items = [p for p in allp if (not p["sites"] if sel == NONE else sel in p["sites"])]
-        with st.expander("🎛️ Filtri"):
-            txt = st.text_input("Cerca produttore")
-            f_c = st.multiselect("Paese", sorted({p["country"] for p in items if p["country"]}))
-            f_r = st.multiselect("Regione", sorted({p["region"] for p in items if p["region"]}))
-            f_s = st.multiselect("Provincia / sotto-regione", sorted({p["subregion"] for p in items if p["subregion"]}))
-            f_t = st.multiselect("Tipo", sorted({t for p in items for t, _, _ in p["styles"] if t}))
-            f_u = st.multiselect("Uva", sorted({g for p in items for _, g, _ in p["styles"] if g}))
-        items = [p for p in items if (not txt or norm(txt) in norm(p["name"])) and (not f_c or p["country"] in f_c)
-                 and (not f_r or p["region"] in f_r) and (not f_s or p["subregion"] in f_s)
-                 and (not f_t or any(t in f_t for t, _, _ in p["styles"])) and (not f_u or any(g in f_u for _, g, _ in p["styles"]))]
+        items = site_filters(items, fbox)
         home = shop_home(shop)
-        st.markdown(f'<div class="wh-sitehead"><h2>{escape("Senza sito assegnato" if sel == NONE else sel)}</h2>'
-                    f'<span>{len(items)} produttori</span>' + (f'<a href="{escape(home, quote=True)}" target="_blank" rel="noopener noreferrer">Apri sito ↗</a>' if home else "")
-                    + "</div>", unsafe_allow_html=True)
-        if items:
-            st.markdown(cards_html(items, shop), unsafe_allow_html=True)
-        else:
-            st.info("Nessun produttore con questi filtri.")
+        with main:
+            st.markdown(f'<div class="wh-sitehead"><h2>{escape("Senza sito assegnato" if sel == NONE else sel)}</h2>'
+                        f'<span>{len(items)} produttori</span>' + (f'<a href="{escape(home, quote=True)}" target="_blank" rel="noopener noreferrer">Apri sito ↗</a>' if home else "")
+                        + "</div>", unsafe_allow_html=True)
+            if items:
+                st.markdown(cards_html(items, shop), unsafe_allow_html=True)
+            else:
+                st.info("Nessun produttore con questi filtri.")
 
 # ── Produttori
 def filter_view(txt):
@@ -1053,7 +1068,7 @@ def shops_phone():
                     st.error("Esiste già un sito con questo nome.")
 
 
-with t3:
+def shops_pc():
     st.caption("Gestisci i siti di e-commerce e verifica il corretto funzionamento dei link di ricerca.")
     
     # Form per aggiungere un nuovo sito in alto
@@ -1120,9 +1135,19 @@ with t3:
                     new_country = st.selectbox("Paese", [scountry] + [c for c in KNOWN_COUNTRIES if c != scountry], index=0, key=f"country_edit_{sid}")
                     new_url = st.text_input("Indirizzo di ricerca", value=surl, key=f"url_edit_{sid}")
                     if st.form_submit_button("Salva modifiche", type="primary"):
-                        with db() as c:  # UPDATE può violare UNIQUE(name)
-                         c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (_cl(new_name), new_country, _cl(new_url), sid))
-                         except sqlite3.IntegrityError:
-                         st.error("Esiste già un sito con questo nome.")
-                         st.stop()
-            st.divider()
+                        try:
+                            with db() as c:  # UPDATE può violare UNIQUE(name)
+                                c.execute("UPDATE shops SET name=?, country=?, url=? WHERE id=?", (_cl(new_name), new_country, _cl(new_url), sid))
+                        except sqlite3.IntegrityError:
+                            st.error("Esiste già un sito con questo nome.")
+                            st.stop()
+                        autosave()
+                        st.session_state[f"editing_shop_{sid}"] = False
+                        st.toast("Modifiche salvate ✅")
+                        st.rerun()
+                        
+with t3:
+    if PHONE:
+        shops_phone()  # schede a espansione, pulsanti larghi
+    else:
+        shops_pc()  # elenco con test link e modifica inline
