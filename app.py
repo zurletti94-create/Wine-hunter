@@ -637,7 +637,7 @@ input,textarea,[data-baseweb="select"] input,[data-baseweb="select"] div{font-si
 div[data-testid="stExpander"] summary{padding:.75rem .9rem}
 </style>"""
 CSS_PC = """<style>
-.block-container{max-width:1240px!important;padding-top:3.5rem!important}
+.block-container{max-width:100%!important;padding-left:2rem!important;padding-right:2rem!important;padding-top:3.5rem!important}
 .wh-grid{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
 .wh-hero{padding:1.3rem 1.6rem}
 .wh-hero h1{font-size:2.3rem!important}
@@ -765,7 +765,7 @@ def producer_form(pid, allp, shops):
                 merged, sug["note"] = merge_suggestion(snap, sug, overwrite)
                 st.session_state.ov, st.session_state.sug = merged, sug
                 st.session_state.fv += 1
-                st.rerun()
+                st.rerun(scope="fragment") if in_dialog else st.rerun()  # nel pop-up resta aperto
     sug = st.session_state.sug
     if sug and sug.get("note"):
         st.warning(sug["note"])
@@ -921,6 +921,9 @@ def search_all_button(cur):
             f'<a class="wh-btn" href="{escape(u, quote=True)}" target="_blank" rel="noopener noreferrer">{escape(n)} ↗</a>' for n, u in targets) + "</div>",
             unsafe_allow_html=True)
 
+@st.dialog("✏️ Modifica produttore", width="large")
+def edit_dialog(pid):
+    producer_form(pid, allp, shops, in_dialog=True)
 
 def producer_detail(sel):
     if sel == "new":
@@ -935,7 +938,11 @@ def producer_detail(sel):
     search_all_button(cur)
     c1, c2 = st.columns(2)
     if c1.button("✏️ Modifica", key=f"ed{sel}", use_container_width=True):
-        st.session_state.editing, st.session_state.confirm = sel, None
+        if PHONE:  # telefono: modifica in pagina
+            st.session_state.editing, st.session_state.confirm = sel, None
+        else:  # PC: pop-up
+            st.session_state.confirm, st.session_state.ov, st.session_state.sug = None, None, None
+            edit_dialog(sel)
     if c2.button("🗑️ Elimina", key=f"rm{sel}", use_container_width=True):
         st.session_state.confirm, st.session_state.editing = sel, None
     if st.session_state.confirm == sel:
@@ -984,6 +991,8 @@ def producers_list_pc():
     st.caption(f"{len(view)} produttori · clicca una riga per aprirla")
     if view:
         table = pd.DataFrame({"Produttore": [f"{FLAGS.get(p['country'], '🍷')} {p['name']}" for p in view],
+                              "Zona": [" · ".join(x for x in (p["region"], p["subregion"]) if x) or p["country"] for p in view],
+                              "Vini": [styles_text(p) for p in view],
                               "Siti": [", ".join(p["sites"]) for p in view]})
         ev = st.dataframe(table, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row",
                           height=560, key=f"ptbl_{st.session_state.tv}_{txt.strip()}")
@@ -1008,7 +1017,7 @@ with t2:
                 st.rerun()
             producer_detail(st.session_state.sel)
     else:
-        left, right = st.columns([2, 3], gap="large")
+        left, right = st.columns([3, 2], gap="large")  # elenco più largo
         with left:
             producers_list_pc()
         with right:
@@ -1032,6 +1041,11 @@ def shops_phone():
         s0 = {**s0, "country": s0["country"] or "", "url": s0["url"] or ""}
         n_p = sum(s0["name"] in p["sites"] for p in allp)
         with st.expander(f"{s0['name']} · {n_p} produttori"):
+            test_link = s0["url"].replace("{q}", "barolo")
+            if test_link.startswith(("http://", "https://")):
+                st.markdown(f'<a class="wh-btn" href="{escape(test_link, quote=True)}" target="_blank" rel="noopener noreferrer">Testa link ↗</a>', unsafe_allow_html=True)
+            else:
+                st.caption("URL non valido")
             nm, ct, url = shop_fields(s0["id"], s0, "sh")
             if st.button("💾 Salva", key=f"shs{s0['id']}", type="primary", use_container_width=True):
                 if not nm:
@@ -1147,7 +1161,4 @@ def shops_pc():
                         st.rerun()
 
 with t3:
-    if PHONE:
-        shops_phone()  # schede a espansione, pulsanti larghi
-    else:
-        shops_pc()  # elenco con test link e modifica inline
+    shops_phone()  # stessa vista su telefono e PC
