@@ -845,9 +845,9 @@ with t1:
         counts[NONE] = sum(not p["sites"] for p in allp)
         fmt = lambda n: f"{n} ({counts[n]})"
         if PHONE:  # telefono: menu sito in alto, filtri richiudibili
-            main = st.container()
             sel = st.selectbox("🛒 Dove vuoi comprare?", options, format_func=fmt, key="phone_shop")
             fbox = st.expander("🎛️ Filtri")
+            main = st.container()  # creato per ultimo: schede sotto menu e filtri
         else:  # PC: elenco siti + filtri a sinistra, schede a destra
             side, main = st.columns([1, 3], gap="large")
             sel = side.radio("🛒 Dove vuoi comprare?", options, format_func=fmt, key="pc_shop")
