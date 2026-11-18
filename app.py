@@ -635,6 +635,7 @@ input,textarea,[data-baseweb="select"] input,[data-baseweb="select"] div{font-si
 [class*="st-key-prow"] button{justify-content:flex-start!important;text-align:left!important;height:auto;min-height:2.9rem;padding:.45rem .7rem;border-radius:12px;white-space:normal;line-height:1.2;font-size:.92rem;font-weight:500}
 [class*="st-key-prow"] button p{text-align:left!important;margin:0}
 div[data-testid="stExpander"] summary{padding:.75rem .9rem}
+div[data-testid="stSelectbox"]{display:block!important;visibility:visible!important;min-height:3rem}
 </style>"""
 CSS_PC = """<style>
 .block-container{max-width:100%!important;padding-left:2rem!important;padding-right:2rem!important;padding-top:3.5rem!important}
@@ -843,9 +844,9 @@ with t1:
         options = sorted(counts, key=lambda n: (-counts[n], n.lower())) + [NONE]
         counts[NONE] = sum(not p["sites"] for p in allp)
         fmt = lambda n: f"{n} ({counts[n]})"
-        if PHONE:  # telefono: tutto in colonna, filtri richiudibili
-            side = main = st.container()
-            sel = st.selectbox("🛒 Dove vuoi comprare?", options, format_func=fmt)
+        if PHONE:  # telefono: menu sito in alto, filtri richiudibili
+            main = st.container()
+            sel = st.selectbox("🛒 Dove vuoi comprare?", options, format_func=fmt, key="phone_shop")
             fbox = st.expander("🎛️ Filtri")
         else:  # PC: elenco siti + filtri a sinistra, schede a destra
             side, main = st.columns([1, 3], gap="large")
