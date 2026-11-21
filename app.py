@@ -720,7 +720,7 @@ def pick(box, label, options, current, key):
     return box.text_input(f"{label}: nuovo valore", key=key + "n").strip() if choice == "➕ Altro…" else (choice or "")
 
 
-def producer_form(pid, allp, shops):
+def producer_form(pid, allp, shops, in_dialog=False):
     cur = next((p for p in allp if p["id"] == pid), None) if pid else None
     key_id = pid or "new"
     if st.session_state.get("ov_owner") != key_id:  # cambiando produttore, le proposte non salvate vengono dimenticate
@@ -733,6 +733,7 @@ def producer_form(pid, allp, shops):
                          help="Propone paese, regione, provincia, tipi di vino e uve: controlla sempre prima di salvare")
     if not has_key:
         st.caption("Per la compilazione automatica serve una chiave GEMINI_API_KEY nei Secrets.")
+        ai_box = st.container()  # qui compaiono "ricerca in corso", errori e avvisi
     overwrite = st.checkbox("Sostituisci anche i campi già compilati", key=k + "ow") if cur else False
     c1, c2 = st.columns(2)
     country = pick(c1, "Paese", [p["country"] for p in allp] + KNOWN_COUNTRIES, base["country"], k + "c")
@@ -751,14 +752,14 @@ def producer_form(pid, allp, shops):
                 "regions": sorted({p["region"] for p in allp if p["region"]}), "subs": sorted({p["subregion"] for p in allp if p["subregion"]}),
                 "types": types, "grapes": sorted({g for p in allp for _, g, _ in p["styles"] if g})}
         res = None
-        with st.spinner("Ricerca in corso… può richiedere fino a un minuto"):
+        with ai_box, st.spinner("Ricerca in corso… può richiedere fino a un minuto"):
             try:
                 res = autofill(name.strip(), opts)
             except Exception as e:
-                st.error(f"Errore: {e}")
+                ai_box.error(f"Errore: {e}")
         if res is not None:
             if res.get("error"):
-                st.warning("Produttore non riconosciuto: compila a mano.")
+                ai_box.warning("Produttore non riconosciuto: compila a mano.")
             else:
                 sug = clean_suggestion(res, opts)
                 snap = {"name": name.strip(), "country": country, "region": region, "subregion": subregion, "notes": notes,
