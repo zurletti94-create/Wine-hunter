@@ -733,7 +733,7 @@ def producer_form(pid, allp, shops, in_dialog=False):
                          help="Propone paese, regione, provincia, tipi di vino e uve: controlla sempre prima di salvare")
     if not has_key:
         st.caption("Per la compilazione automatica serve una chiave GEMINI_API_KEY nei Secrets.")
-        ai_box = st.container()  # qui compaiono "ricerca in corso", errori e avvisi
+    ai_box = st.container()  # qui compaiono "ricerca in corso", errori e avvisi
     overwrite = st.checkbox("Sostituisci anche i campi già compilati", key=k + "ow") if cur else False
     c1, c2 = st.columns(2)
     country = pick(c1, "Paese", [p["country"] for p in allp] + KNOWN_COUNTRIES, base["country"], k + "c")
