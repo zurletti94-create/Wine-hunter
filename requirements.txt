@@ -2,3 +2,4 @@ streamlit
 pandas
 requests
 openpyxl
+Authlib>=1.3.2
