@@ -816,6 +816,7 @@ _n = lambda sql: int(q(sql).iloc[0, 0])
 st.markdown(hero_html(PHONE, _n("SELECT COUNT(*) FROM producers"), _n("SELECT COUNT(*) FROM shops"), _n("SELECT COUNT(*) FROM avail")),
             unsafe_allow_html=True)
 st.segmented_control("Vista", _opts, key="vista", label_visibility="collapsed")
+st.download_button("⬇️ Scarica backup", json.dumps(dump(), ensure_ascii=False, default=str, indent=1), "cantina_data.json", "application/json")
 t1, t2, t3 = st.tabs(["🛒 Per sito", "📒 Produttori", "🌐 Siti"])
 allp = load_all()
 shops_df = q("SELECT id,name,country,url FROM shops ORDER BY name COLLATE NOCASE")
