@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import re
@@ -303,9 +304,8 @@ def autosave():
 
 
 @st.cache_resource
-def first_boot():
-    """Una volta per avvio: se il database è vuoto, ripristina i dati da GitHub."""
-    return q("SELECT 1 FROM producers LIMIT 1").empty and pull_backup()
+def booted():
+    return set()  # file database già inizializzati in questo avvio
 
 
 # ───────────────────────── Dati ─────────────────────────
@@ -801,11 +801,21 @@ def producer_form(pid, allp, shops, in_dialog=False):
 
 # ───────────────────────── Interfaccia ─────────────────────────
 st.set_page_config(page_title="Cantina", page_icon="🍷", layout="wide")
+if not st.user.is_logged_in:
+    st.title("🍷 Cantina")
+    st.write("Accedi per aprire la tua rubrica privata.")
+    st.button("Accedi con Google", on_click=st.login, type="primary")
+    st.stop()
+EMAIL = (st.user.email or "").lower()
+if EMAIL != str(secret("OWNER_EMAIL", "")).lower():  # tu usi i file originali, gli altri uno proprio
+    uid = hashlib.sha256(EMAIL.encode()).hexdigest()[:16]
+    DB, GH_FILE = f"cantina_{uid}.db", f"cantina_data_{uid}.json"
 init()
 first_boot()
-for _k, _v in (("fv", 0), ("tv", 0), ("confirm", None), ("ov", None), ("sug", None), ("ov_owner", None), ("sel", None), ("editing", None),
-               ("last_tbl", None), ("last_txt", ""), ("limit", 40), ("confirm_shop", None)):
-    st.session_state.setdefault(_k, _v)
+if DB not in booted():  # una volta per utente: se vuoto, ripristina da GitHub
+    booted().add(DB)
+    if q("SELECT 1 FROM producers LIMIT 1").empty:
+        pull_backup()
 _opts = ["📱 Telefono", "💻 Computer"]
 if "vista" not in st.session_state:
     st.session_state.vista = _opts[1] if (st.query_params.get("v") or device_default()) == "pc" else _opts[0]
@@ -815,7 +825,9 @@ st.markdown(CSS + CSS_MORE + CSS_THEME + (CSS_PHONE if PHONE else CSS_PC), unsaf
 _n = lambda sql: int(q(sql).iloc[0, 0])
 st.markdown(hero_html(PHONE, _n("SELECT COUNT(*) FROM producers"), _n("SELECT COUNT(*) FROM shops"), _n("SELECT COUNT(*) FROM avail")),
             unsafe_allow_html=True)
-st.segmented_control("Vista", _opts, key="vista", label_visibility="collapsed")
+cv, cu = st.columns([3, 1])
+cv.segmented_control("Vista", _opts, key="vista", label_visibility="collapsed")
+cu.button("Esci", on_click=st.logout)
 st.download_button("⬇️ Scarica backup", json.dumps(dump(), ensure_ascii=False, default=str, indent=1), "cantina_data.json", "application/json")
 t1, t2, t3 = st.tabs(["🛒 Per sito", "📒 Produttori", "🌐 Siti"])
 allp = load_all()
