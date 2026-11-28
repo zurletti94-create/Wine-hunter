@@ -815,6 +815,9 @@ if DB not in booted():  # una volta per utente: se vuoto, ripristina da GitHub
     booted().add(DB)
     if q("SELECT 1 FROM producers LIMIT 1").empty:
         pull_backup()
+for _k, _v in (("fv", 0), ("tv", 0), ("confirm", None), ("ov", None), ("sug", None), ("ov_owner", None), ("sel", None), ("editing", None),
+               ("last_tbl", None), ("last_txt", ""), ("limit", 40), ("confirm_shop", None)):
+    st.session_state.setdefault(_k, _v)
 _opts = ["📱 Telefono", "💻 Computer"]
 if "vista" not in st.session_state:
     st.session_state.vista = _opts[1] if (st.query_params.get("v") or device_default()) == "pc" else _opts[0]
