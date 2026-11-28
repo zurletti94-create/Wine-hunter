@@ -811,7 +811,6 @@ if EMAIL != str(secret("OWNER_EMAIL", "")).lower():  # tu usi i file originali, 
     uid = hashlib.sha256(EMAIL.encode()).hexdigest()[:16]
     DB, GH_FILE = f"cantina_{uid}.db", f"cantina_data_{uid}.json"
 init()
-first_boot()
 if DB not in booted():  # una volta per utente: se vuoto, ripristina da GitHub
     booted().add(DB)
     if q("SELECT 1 FROM producers LIMIT 1").empty:
